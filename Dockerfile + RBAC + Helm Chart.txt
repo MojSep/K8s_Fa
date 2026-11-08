@@ -1,0 +1,1448 @@
+﻿🐳 Dockerfile + RBAC + Helm Chart — بسته‌ی کامل استقرار
+
+    دو مسیر: (۱) Dockerfile + RBAC خام برای استقرار سریع، (۲) Helm Chart کامل برای چند-کلاستر. هر دو به یک image مشترک نیاز دارند.
+
+text
+
+k8s-health/
+├── Dockerfile
+├── requirements.txt
+├── k8s_health_exporter.py           # نسخه pod-mode
+├── Makefile
+└── chart/
+    └── k8s-health/
+        ├── Chart.yaml
+        ├── values.yaml
+        ├── README.md
+        ├── .helmignore
+        └── templates/
+            ├── _helpers.tpl
+            ├── serviceaccount.yaml
+            ├── clusterrole.yaml
+            ├── clusterrolebinding.yaml
+            ├── configmap-exporter.yaml
+            ├── secret-alertmanager.yaml
+            ├── configmap-alertmanager.yaml
+            ├── deployment-cluster.yaml
+            ├── daemonset-node.yaml
+            ├── service.yaml
+            ├── servicemonitor.yaml
+            ├── prometheusrule.yaml
+            ├── notes.txt
+            └── tests/test-metrics.yaml
+
+📄 بخش A: Dockerfile
+dockerfile
+
+# syntax=docker/dockerfile:1.7
+FROM python:3.12-slim AS base
+
+ARG KUBECTL_VERSION=v1.29.4
+ARG TARGETARCH=amd64
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    KUBECTL=/usr/local/bin/kubectl
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl jq openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSLo /usr/local/bin/kubectl \
+      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
+    && chmod +x /usr/local/bin/kubectl \
+    && /usr/local/bin/kubectl version --client=true --output=yaml | head -5
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY k8s_health_exporter.py /app/
+
+# ── Non-root capability (for cluster mode; node DS overrides with runAsUser: 0)
+RUN useradd -r -u 1000 -g root health && chown -R 1000:0 /app
+USER 1000:1000
+
+EXPOSE 9876
+ENTRYPOINT ["python3", "/app/k8s_health_exporter.py"]
+
+requirements.txt:
+txt
+
+prometheus_client>=0.19.0,<1.0
+
+Makefile:
+makefile
+
+IMAGE    ?= ghcr.io/your-org/k8s-health
+TAG      ?= 1.0.0
+PLATFORMS?= linux/amd64,linux/arm64
+
+.PHONY: build push release helm-lint helm-template helm-install
+
+build:
+	docker buildx build --platform $(PLATFORMS) --load -t $(IMAGE):$(TAG) .
+push:
+	docker buildx build --platform $(PLATFORMS) --push -t $(IMAGE):$(TAG) .
+release: push
+	@echo "pushed $(IMAGE):$(TAG)"
+
+helm-lint:
+	helm lint chart/k8s-health
+helm-template:
+	helm template k8s-health chart/k8s-health --debug > /tmp/render.yaml
+helm-install:
+	helm upgrade --install k8s-health chart/k8s-health -n k8s-monitoring --create-namespace
+
+📄 بخش B: تغییرات Python برای Pod Mode
+
+در فایل k8s_health_exporter.py این تغییرات را اعمال کن:
+۱. متغیرهای محیطی جدید (بالای فایل، کنار بقیه)
+python
+
+MODE       = os.environ.get("MODE", "both")       # cluster | node | both
+HOST_ROOT  = os.environ.get("HOST_ROOT", "")      # e.g. /host
+NODE_NAME  = os.environ.get("NODE_NAME", os.environ.get("HOSTNAME", "unknown"))
+
+def host_path(p: str) -> str:
+    return f"{HOST_ROOT}{p}" if HOST_ROOT else p
+
+def in_mode(*modes: str) -> bool:
+    return MODE == "both" or MODE in modes
+
+۲. متریک‌های حالت
+python
+
+GAUGES["mode_info"] = Gauge(
+    "k8s_health_mode_info", "1 for the running mode and node",
+    ["mode", "node"])
+
+۳. بازنویسی check_host() — از host_path و label نود
+python
+
+def check_host():
+    if not in_mode("node"):
+        return
+    # disk usage با prefix
+    entries = []
+    for path in DISK_PATHS:
+        real = host_path(path)
+        try:
+            st = os.statvfs(real)
+            used = 1 - (st.f_bavail / st.f_blocks)
+            entries.append(({"path": path, "node": NODE_NAME}, used))
+        except Exception:
+            pass
+    if entries:
+        _replace_all_node(GAUGES["disk_usage"], entries)
+
+    # swap
+    try:
+        with open(host_path("/proc/swaps")) as f:
+            lines = [l for l in f.read().splitlines()[1:] if l.strip()]
+        GAUGES["swap_active"].labels(node=NODE_NAME).set(1 if lines else 0)
+    except Exception:
+        GAUGES["swap_active"].labels(node=NODE_NAME).set(0)
+
+    # sysctl — اگر hostPath mount /proc/sys باشد
+    try:
+        with open(host_path("/proc/sys/net/ipv4/ip_forward")) as f:
+            ipf = f.read().strip() == "1"
+        with open(host_path("/proc/sys/net/bridge/bridge-nf-call-iptables")) as f:
+            bri = f.read().strip() == "1"
+        GAUGES["sysctl_ok"].labels(node=NODE_NAME).set(1 if (ipf and bri) else 0)
+    except Exception:
+        GAUGES["sysctl_ok"].labels(node=NODE_NAME).set(0)
+
+    # kernel modules
+    try:
+        with open(host_path("/proc/modules")) as f:
+            mods = f.read()
+        ok = all(f"{m} " in mods for m in ("overlay", "br_netfilter"))
+        GAUGES["kernel_ok"].labels(node=NODE_NAME).set(1 if ok else 0)
+    except Exception:
+        GAUGES["kernel_ok"].labels(node=NODE_NAME).set(0)
+
+    # kubelet/containerd — با hostPID، از /proc می‌خوانیم
+    for svc in ("kubelet", "containerd"):
+        pids = _proc_find(host_path("/proc"), svc)
+        GAUGES[f"{svc}_active"].labels(node=NODE_NAME).set(1 if pids else 0)
+
+def _proc_find(proc_root: str, name: str) -> list:
+    """جستجوی process با name در /proc (hostPID لازم است)."""
+    hits = []
+    try:
+        for pid in os.listdir(proc_root):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"{proc_root}/{pid}/comm") as f:
+                    if f.read().strip() == name:
+                        hits.append(pid)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return hits
+
+۴. بازنویسی check_certs() — fallback به openssl
+python
+
+def check_certs():
+    """در cluster mode با kubeadm؛ در pod mode با openssl روی hostPath."""
+    if not in_mode("cluster"):
+        return
+    import glob, re
+    pki = host_path("/etc/kubernetes/pki")
+    if not os.path.isdir(pki):
+        log.debug("no pki dir at %s", pki); return
+
+    entries = []
+    for cert_file in glob.glob(f"{pki}/**/*.crt", recursive=True):
+        try:
+            r = subprocess.run(
+                ["openssl", "x509", "-in", cert_file, "-noout", "-enddate"],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode != 0:
+                continue
+            m = re.search(r"notAfter=(.+)", r.stdout)
+            if not m:
+                continue
+            exp = datetime.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z")
+            exp = exp.replace(tzinfo=timezone.utc)
+            days = int((exp - datetime.now(timezone.utc)).total_seconds() / 86400)
+            name = os.path.relpath(cert_file, pki).replace("/", "_")
+            entries.append(({"name": name}, days))
+        except Exception:
+            continue
+    if entries:
+        replace_all(GAUGES["cert_days"], entries)
+
+۵. تنظیم پرچم‌های mode در main()
+python
+
+def main():
+    log.info("starting mode=%s node=%s host_root=%s port=%d interval=%d",
+             MODE, NODE_NAME, HOST_ROOT or "-", PORT, INTERVAL)
+    GAUGES["mode_info"].labels(mode=MODE, node=NODE_NAME).set(1)
+    start_http_server(PORT)
+    # ...
+
+۶. متریک‌های host باید label node داشته باشند
+python
+
+GAUGES["swap_active"]    = Gauge("k8s_health_swap_active",    "1 if swap", ["node"])
+GAUGES["sysctl_ok"]      = Gauge("k8s_health_sysctl_ok",      "1 if sysctl ok", ["node"])
+GAUGES["kernel_ok"]      = Gauge("k8s_health_kernel_modules_ok", "1 if modules loaded", ["node"])
+GAUGES["kubelet_active"] = Gauge("k8s_health_kubelet_active", "1 if active", ["node"])
+GAUGES["containerd_active"] = Gauge("k8s_health_containerd_active", "1 if active", ["node"])
+GAUGES["disk_usage"]     = Gauge("k8s_health_disk_usage_ratio", "Disk usage", ["path", "node"])
+
+و در PromQL از sum by (node) استفاده کن.
+📄 بخش C: RBAC خام (استقرار سریع بدون Helm)
+rbac.yaml
+yaml
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8s-monitoring
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-health
+  namespace: k8s-monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-health
+rules:
+  # منابع اصلی
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - pods
+      - namespaces
+      - services
+      - endpoints
+      - persistentvolumeclaims
+      - persistentvolumes
+      - configmaps
+      - secrets
+      - serviceaccounts
+    verbs: [get, list, watch]
+  # exec برای بررسی etcd و برخی fallbackها
+  - apiGroups: [""]
+    resources:
+      - pods/exec
+      - pods/log
+    verbs: [create, get]
+  # workloads
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  # storage
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses, volumeattachments, csidrivers, csistoragecapacities]
+    verbs: [get, list, watch]
+  # webhooks
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [validatingwebhookconfigurations, mutatingwebhookconfigurations]
+    verbs: [get, list, watch]
+  # leader election
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch]
+  # endpointslices
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  # readyz / livez
+  - nonResourceURLs: ["/readyz", "/livez", "/healthz", "/version", "/metrics"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-health
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-health
+subjects:
+  - kind: ServiceAccount
+    name: k8s-health
+    namespace: k8s-monitoring
+
+deployment-cluster.yaml (مستقر روی master)
+yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-health-cluster
+  namespace: k8s-monitoring
+  labels: {app: k8s-health, mode: cluster}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: k8s-health, mode: cluster}
+  template:
+    metadata:
+      labels: {app: k8s-health, mode: cluster}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9876"
+    spec:
+      serviceAccountName: k8s-health
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      containers:
+        - name: exporter
+          image: ghcr.io/your-org/k8s-health:1.0.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: cluster
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: HOST_ROOT
+              value: /host
+            - name: CHECK_INTERVAL
+              value: "60"
+            - name: METRIC_PORT
+              value: "9876"
+          ports:
+            - {name: metrics, containerPort: 9876}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits:   {cpu: 500m, memory: 256Mi}
+          # فقط pki برای cert-check (بدون دسترسی به /etc/kubernetes/manifests)
+          volumeMounts:
+            - name: host-kubernetes-pki
+              mountPath: /host/etc/kubernetes/pki
+              readOnly: true
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+      volumes:
+        - name: host-kubernetes-pki
+          hostPath:
+            path: /etc/kubernetes/pki
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-health-cluster
+  namespace: k8s-monitoring
+  labels: {app: k8s-health, mode: cluster}
+spec:
+  ports:
+    - {name: metrics, port: 9876, targetPort: metrics}
+  selector: {app: k8s-health, mode: cluster}
+
+daemonset-node.yaml (روی هر نود)
+yaml
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: k8s-health-node
+  namespace: k8s-monitoring
+  labels: {app: k8s-health, mode: node}
+spec:
+  selector:
+    matchLabels: {app: k8s-health, mode: node}
+  template:
+    metadata:
+      labels: {app: k8s-health, mode: node}
+    spec:
+      serviceAccountName: k8s-health
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - {operator: Exists}   # روی همه نودها اجرا شود
+      containers:
+        - name: exporter
+          image: ghcr.io/your-org/k8s-health:1.0.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: node
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: HOST_ROOT
+              value: /host
+            - name: CHECK_INTERVAL
+              value: "60"
+            - name: METRIC_PORT
+              value: "9876"
+          ports:
+            - {name: metrics, containerPort: 9876}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits:   {cpu: 200m, memory: 128Mi}
+          volumeMounts:
+            - {name: host-root, mountPath: /host, mountPropagation: HostToContainer}
+          securityContext:
+            runAsUser: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+      volumes:
+        - name: host-root
+          hostPath: {path: /}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-health-node
+  namespace: k8s-monitoring
+  labels: {app: k8s-health, mode: node}
+spec:
+  # headless برای scrape per-pod
+  clusterIP: None
+  ports:
+    - {name: metrics, port: 9876, targetPort: metrics}
+  selector: {app: k8s-health, mode: node}
+
+Deploy یک‌مرحله‌ای
+bash
+
+kubectl apply -f rbac.yaml
+kubectl apply -f deployment-cluster.yaml
+kubectl apply -f daemonset-node.yaml
+
+📦 بخش D: Helm Chart کامل
+chart/k8s-health/Chart.yaml
+yaml
+
+apiVersion: v2
+name: k8s-health
+description: Kubernetes cluster health exporter (cluster + node modes) with Prometheus rules
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.24.0-0"
+keywords: [kubernetes, prometheus, health, monitoring, exporter]
+home: https://github.com/your-org/k8s-health
+sources:
+  - https://github.com/your-org/k8s-health
+maintainers:
+  - name: Your Name
+    email: you@example.com
+
+chart/k8s-health/.helmignore
+text
+
+.DS_Store
+*.swp
+*.bak
+*.tmp
+*~
+.git
+.gitignore
+.vscode
+.idea
+ci
+
+chart/k8s-health/values.yaml
+yaml
+
+# ─────────────────────────────────────────────
+# Global
+# ─────────────────────────────────────────────
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/your-org/k8s-health
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# ─────────────────────────────────────────────
+# Cluster-mode Deployment (on control-plane)
+# ─────────────────────────────────────────────
+cluster:
+  enabled: true
+  replicaCount: 1
+  interval: 60
+  port: 9876
+  # hostPath برای بررسی certificates
+  pkiHostPath: /etc/kubernetes/pki
+  nodeSelector: {}
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      effect: NoSchedule
+  affinity: {}
+  # اگر روی master زمان‌بندی نمی‌کنی، affinity را حذف کن
+  scheduleOnControlPlane: true
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits:   {cpu: 500m, memory: 256Mi}
+  securityContext:
+    runAsUser: 1000
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: {drop: [ALL]}
+  podAnnotations: {}
+  podLabels: {}
+
+# ─────────────────────────────────────────────
+# Node-mode DaemonSet (on all nodes)
+# ─────────────────────────────────────────────
+node:
+  enabled: true
+  interval: 60
+  port: 9876
+  # hostPID برای خواندن /proc نود
+  hostPID: true
+  hostNetwork: true
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits:   {cpu: 200m, memory: 128Mi}
+  securityContext:
+    runAsUser: 0
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: {drop: [ALL]}
+  podAnnotations: {}
+  podLabels: {}
+
+# ─────────────────────────────────────────────
+# RBAC
+# ─────────────────────────────────────────────
+rbac:
+  create: true
+  # اگر از قبل ClusterRole داری، نامش را بگذار
+  existingClusterRole: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# ─────────────────────────────────────────────
+# ServiceMonitor (Prometheus Operator)
+# ─────────────────────────────────────────────
+serviceMonitor:
+  enabled: false
+  namespace: ""          # default = release namespace
+  interval: 60s
+  scrapeTimeout: 30s
+  labels: {}
+  relabelings: []
+  metricRelabelings: []
+
+# ─────────────────────────────────────────────
+# PrometheusRule (Alerting)
+# ─────────────────────────────────────────────
+prometheusRule:
+  enabled: true
+  namespace: ""          # default = release namespace
+  labels: {}
+  rules:
+    nodeNotReady:
+      duration: 2m
+      severity: critical
+    certExpiringSoonDays: 30
+    certExpiringCriticalDays: 7
+    etcdDBSizeBytes: 2147483648    # 2Gi
+    apiLatencySeconds: 3
+    diskUsageRatio: 0.85
+    podRestarts: 5
+
+# ─────────────────────────────────────────────
+# Alertmanager Config (optional, generates a Secret)
+# ─────────────────────────────────────────────
+alertmanagerConfig:
+  enabled: false
+  slackWebhookUrl: ""
+  slackChannelWarnings: "#k8s-warnings"
+  slackChannelCritical: "#k8s-critical"
+  telegramBotToken: ""
+  telegramChatId: ""
+
+# ─────────────────────────────────────────────
+# Pod Disruption Budget
+# ─────────────────────────────────────────────
+pdb:
+  enabled: false
+  minAvailable: 1
+
+# ─────────────────────────────────────────────
+# Network Policy
+# ─────────────────────────────────────────────
+networkPolicy:
+  enabled: false
+  # فقط اجازه‌ی scrape از namespace مانیتورینگ
+  prometheusNamespaceSelector: {}
+  prometheusPodSelector: {}
+
+chart/k8s-health/templates/_helpers.tpl
+text
+
+{{/* name */}}
+{{- define "k8s-health.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/* fullname */}}
+{{- define "k8s-health.fullname" -}}
+{{- if .Values.fullnameOverride }}{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}{{- printf "%s-%s" .Release.Name (include "k8s-health.name" .) | trunc 63 | trimSuffix "-" }}{{- end }}
+{{- end }}
+
+{{/* labels */}}
+{{- define "k8s-health.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
+app.kubernetes.io/name: {{ include "k8s-health.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/* selectorLabels */}}
+{{- define "k8s-health.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "k8s-health.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/* serviceAccountName */}}
+{{- define "k8s-health.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- default (include "k8s-health.fullname" .) .Values.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/* clusterRoleName */}}
+{{- define "k8s-health.clusterRoleName" -}}
+{{- if .Values.rbac.existingClusterRole }}{{ .Values.rbac.existingClusterRole }}
+{{- else }}{{ include "k8s-health.fullname" . }}{{ end }}
+{{- end }}
+
+{{/* serviceMonitor namespace */}}
+{{- define "k8s-health.smNamespace" -}}
+{{- default .Release.Namespace .Values.serviceMonitor.namespace }}
+{{- end }}
+
+{{/* prometheusRule namespace */}}
+{{- define "k8s-health.prNamespace" -}}
+{{- default .Release.Namespace .Values.prometheusRule.namespace }}
+{{- end }}
+
+{{/* image */}}
+{{- define "k8s-health.image" -}}
+{{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
+{{- end }}
+
+templates/serviceaccount.yaml
+yaml
+
+{{- if .Values.serviceAccount.create -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "k8s-health.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "k8s-health.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+
+templates/clusterrole.yaml
+yaml
+
+{{- if and .Values.rbac.create (not .Values.rbac.existingClusterRole) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "k8s-health.clusterRoleName" . }}
+  labels: {{- include "k8s-health.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods, namespaces, services, endpoints,
+               persistentvolumeclaims, persistentvolumes,
+               configmaps, secrets, serviceaccounts]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/exec, pods/log]
+    verbs: [create, get]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses, volumeattachments, csidrivers, csistoragecapacities]
+    verbs: [get, list, watch]
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [validatingwebhookconfigurations, mutatingwebhookconfigurations]
+    verbs: [get, list, watch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - nonResourceURLs: ["/readyz", "/livez", "/healthz", "/version", "/metrics"]
+    verbs: [get]
+{{- end }}
+
+templates/clusterrolebinding.yaml
+yaml
+
+{{- if or .Values.rbac.create .Values.rbac.existingClusterRole }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "k8s-health.fullname" . }}
+  labels: {{- include "k8s-health.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "k8s-health.clusterRoleName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "k8s-health.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+
+templates/deployment-cluster.yaml
+yaml
+
+{{- if .Values.cluster.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "k8s-health.fullname" . }}-cluster
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-health.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster
+spec:
+  replicas: {{ .Values.cluster.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "k8s-health.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: cluster
+  template:
+    metadata:
+      labels:
+        {{- include "k8s-health.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: cluster
+        {{- with .Values.cluster.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.cluster.port }}"
+        {{- with .Values.cluster.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ include "k8s-health.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      {{- with .Values.cluster.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.cluster.scheduleOnControlPlane }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      {{- else }}
+      {{- with .Values.cluster.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.cluster.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: exporter
+          image: {{ include "k8s-health.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - {name: MODE, value: cluster}
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: HOST_ROOT, value: /host}
+            - {name: CHECK_INTERVAL, value: {{ .Values.cluster.interval | quote }}}
+            - {name: METRIC_PORT, value: {{ .Values.cluster.port | quote }}}
+            - {name: LOG_LEVEL, value: INFO}
+          ports:
+            - {name: metrics, containerPort: {{ .Values.cluster.port }}, protocol: TCP}
+          readinessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          livenessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            initialDelaySeconds: 15
+            periodSeconds: 60
+            failureThreshold: 5
+          resources: {{- toYaml .Values.cluster.resources | nindent 12 }}
+          securityContext: {{- toYaml .Values.cluster.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: host-pki
+              mountPath: /host/etc/kubernetes/pki
+              readOnly: true
+      volumes:
+        - name: host-pki
+          hostPath:
+            path: {{ .Values.cluster.pkiHostPath }}
+            type: Directory
+{{- end }}
+
+templates/daemonset-node.yaml
+yaml
+
+{{- if .Values.node.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "k8s-health.fullname" . }}-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-health.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  selector:
+    matchLabels:
+      {{- include "k8s-health.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        {{- include "k8s-health.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: node
+        {{- with .Values.node.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.node.port }}"
+        {{- with .Values.node.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ include "k8s-health.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      hostPID: {{ .Values.node.hostPID }}
+      hostNetwork: {{ .Values.node.hostNetwork }}
+      {{- if .Values.node.hostNetwork }}
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      {{- with .Values.node.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: exporter
+          image: {{ include "k8s-health.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - {name: MODE, value: node}
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: HOST_ROOT, value: /host}
+            - {name: CHECK_INTERVAL, value: {{ .Values.node.interval | quote }}}
+            - {name: METRIC_PORT, value: {{ .Values.node.port | quote }}}
+            - {name: LOG_LEVEL, value: INFO}
+          ports:
+            - {name: metrics, containerPort: {{ .Values.node.port }}, protocol: TCP}
+          readinessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          livenessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            initialDelaySeconds: 15
+            periodSeconds: 60
+            failureThreshold: 5
+          resources: {{- toYaml .Values.node.resources | nindent 12 }}
+          securityContext: {{- toYaml .Values.node.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              mountPropagation: HostToContainer
+              readOnly: true
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+{{- end }}
+
+templates/service.yaml
+yaml
+
+{{- if .Values.cluster.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "k8s-health.fullname" . }}-cluster
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-health.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: {{ .Values.cluster.port }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "k8s-health.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster
+{{- end }}
+---
+{{- if .Values.node.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "k8s-health.fullname" . }}-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-health.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  clusterIP: None  # headless → scrape per-pod
+  ports:
+    - name: metrics
+      port: {{ .Values.node.port }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "k8s-health.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+{{- end }}
+
+templates/servicemonitor.yaml
+yaml
+
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "k8s-health.fullname" . }}
+  namespace: {{ include "k8s-health.smNamespace" . }}
+  labels:
+    {{- include "k8s-health.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}{{ toYaml . | nindent 4 }}{{- end }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  selector:
+    matchLabels:
+      {{- include "k8s-health.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+      {{- with .Values.serviceMonitor.relabelings }}
+      relabelings: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.serviceMonitor.metricRelabelings }}
+      metricRelabelings: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+
+templates/prometheusrule.yaml
+yaml
+
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "k8s-health.fullname" . }}
+  namespace: {{ include "k8s-health.prNamespace" . }}
+  labels:
+    {{- include "k8s-health.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}{{ toYaml . | nindent 4 }}{{- end }}
+spec:
+  groups:
+    - name: k8s-health-critical
+      interval: 30s
+      rules:
+        - alert: K8sHealthExporterDown
+          expr: up{job="k8s-health"} == 0
+          for: 2m
+          labels: {severity: critical}
+          annotations:
+            summary: "Health exporter on {{`{{ $labels.instance }}`}} is down"
+        - alert: K8sHealthCheckFailed
+          expr: k8s_health_exporter_up == 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Health check cycles failing on {{`{{ $labels.instance }}`}}"
+        - alert: K8sNodeNotReady
+          expr: k8s_health_node_ready == 0
+          for: {{ .Values.prometheusRule.rules.nodeNotReady.duration }}
+          labels: {severity: {{ .Values.prometheusRule.rules.nodeNotReady.severity }}}
+          annotations:
+            summary: "Node {{`{{ $labels.node }}`}} NotReady"
+        - alert: K8sAPIServerDown
+          expr: k8s_health_readyz == 0
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "API Server /readyz failing on {{`{{ $labels.instance }}`}}"
+        - alert: K8sControlPlanePodDown
+          expr: k8s_health_control_plane_pod_up == 0
+          for: 2m
+          labels: {severity: critical}
+          annotations:
+            summary: "Control plane {{`{{ $labels.component }}`}} down"
+        - alert: K8sEtcdUnhealthy
+          expr: k8s_health_etcd_healthy == 0
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "etcd unhealthy on {{`{{ $labels.instance }}`}}"
+        - alert: K8sEtcdNoLeader
+          expr: k8s_health_etcd_has_leader == 0
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "etcd has no leader"
+        - alert: K8sEtcdDbSizeHigh
+          expr: k8s_health_etcd_dbsize_bytes > {{ .Values.prometheusRule.rules.etcdDBSizeBytes }}
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "etcd DB large ({{`{{ $value | humanize1024 }}`}}B)"
+        - alert: K8sCertExpiringSoon
+          expr: k8s_health_cert_expires_days < {{ .Values.prometheusRule.rules.certExpiringSoonDays }}
+          for: 1h
+          labels: {severity: warning}
+          annotations:
+            summary: "Cert {{`{{ $labels.name }}`}} expires in {{`{{ $value }}`}}d"
+        - alert: K8sCertExpiringCritical
+          expr: k8s_health_cert_expires_days < {{ .Values.prometheusRule.rules.certExpiringCriticalDays }}
+          for: 10m
+          labels: {severity: critical}
+          annotations:
+            summary: "Cert {{`{{ $labels.name }}`}} expires in {{`{{ $value }}`}}d"
+        - alert: K8sCertExpired
+          expr: k8s_health_cert_expires_days < 0
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "Cert {{`{{ $labels.name }}`}} EXPIRED"
+        - alert: K8sCoreDNSDown
+          expr: k8s_health_coredns_ready_ratio < 1
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "CoreDNS degraded"
+        - alert: K8sKubeProxyDegraded
+          expr: k8s_health_kubeproxy_ready_ratio < 1
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "kube-proxy degraded"
+        - alert: K8sCNIDegraded
+          expr: k8s_health_cni_ready_ratio < 1
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "CNI {{`{{ $labels.name }}`}} degraded"
+        - alert: K8sPodHighRestarts
+          expr: k8s_health_pod_restarts > {{ .Values.prometheusRule.rules.podRestarts }}
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "Pod {{`{{ $labels.namespace }}/{{ $labels.pod }}`}} restarts"
+        - alert: K8sPVCUnbound
+          expr: k8s_health_pvc_unbound_count > 0
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: "Unbound PVCs"
+        - alert: K8sAPILatencyHigh
+          expr: k8s_health_api_latency_seconds > {{ .Values.prometheusRule.rules.apiLatencySeconds }}
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "API latency {{`{{ $value }}`}}s"
+        - alert: K8sDiskUsageHigh
+          expr: k8s_health_disk_usage_ratio > {{ .Values.prometheusRule.rules.diskUsageRatio }}
+          for: 10m
+          labels: {severity: critical}
+          annotations:
+            summary: "Disk {{`{{ $labels.path }}`}} on {{`{{ $labels.node }}`}} full"
+        - alert: K8sSwapActive
+          expr: k8s_health_swap_active == 1
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Swap enabled on {{`{{ $labels.node }}`}}"
+        - alert: K8sKubeletDown
+          expr: k8s_health_kubelet_active == 0
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "kubelet inactive on {{`{{ $labels.node }}`}}"
+        - alert: K8sContainerdDown
+          expr: k8s_health_containerd_active == 0
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "containerd inactive on {{`{{ $labels.node }}`}}"
+{{- end }}
+
+templates/secret-alertmanager.yaml
+yaml
+
+{{- if .Values.alertmanagerConfig.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "k8s-health.fullname" . }}-alertmanager-config
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "k8s-health.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  alertmanager.yaml: |
+    global:
+      resolve_timeout: 5m
+      {{- if .Values.alertmanagerConfig.slackWebhookUrl }}
+      slack_api_url: '{{ .Values.alertmanagerConfig.slackWebhookUrl }}'
+      {{- end }}
+    route:
+      receiver: warnings
+      group_by: [alertname, cluster, instance]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        - matchers: ['severity="critical"']
+          receiver: critical
+          group_wait: 10s
+          repeat_interval: 1h
+    inhibit_rules:
+      - source_matchers: ['alertname="K8sAPIServerDown"']
+        target_matchers: ['severity=~"warning|critical"']
+        equal: [instance]
+      - source_matchers: ['alertname="K8sNodeNotReady"']
+        target_matchers: ['alertname=~"K8sPod.*|K8sDeployment.*"']
+        equal: [node]
+    receivers:
+      - name: warnings
+        slack_configs:
+          - channel: '{{ .Values.alertmanagerConfig.slackChannelWarnings }}'
+            send_resolved: true
+            title: '{{`{{ .Status | toUpper }}`}} — {{`{{ .CommonLabels.alertname }}`}}'
+            text: |
+              *Severity*: {{`{{ .CommonLabels.severity }}`}}
+              *Instance*: {{`{{ .CommonLabels.instance }}`}}
+              {{`{{ range .Alerts -}}`}}
+              • {{`{{ .Annotations.summary }}`}}
+              {{`{{ end }}`}}
+      - name: critical
+        slack_configs:
+          - channel: '{{ .Values.alertmanagerConfig.slackChannelCritical }}'
+            send_resolved: true
+            title: '🚨 CRITICAL — {{`{{ .CommonLabels.alertname }}`}}'
+            text: '{{`{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ end }}`}}'
+        {{- if and .Values.alertmanagerConfig.telegramBotToken .Values.alertmanagerConfig.telegramChatId }}
+        webhook_configs:
+          - url: 'https://api.telegram.org/bot{{ .Values.alertmanagerConfig.telegramBotToken }}/sendMessage?chat_id={{ .Values.alertmanagerConfig.telegramChatId }}'
+            send_resolved: true
+        {{- end }}
+{{- end }}
+
+templates/notes.txt
+text
+
+{{- if .Values.cluster.enabled }}
+✅ Cluster exporter:
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "k8s-health.fullname" . }}-cluster {{ .Values.cluster.port }}
+   curl http://localhost:{{ .Values.cluster.port }}/metrics
+{{- end }}
+
+{{- if .Values.node.enabled }}
+✅ Node exporter (DaemonSet):
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=node
+   kubectl -n {{ .Release.Namespace }} port-forward <node-pod> {{ .Values.node.port }}
+{{- end }}
+
+{{- if .Values.serviceMonitor.enabled }}
+✅ ServiceMonitor active (Prometheus will scrape automatically)
+{{- end }}
+
+{{- if .Values.prometheusRule.enabled }}
+✅ PrometheusRule installed ({{ len .Values.prometheusRule.rules }} groups)
+{{- end }}
+
+⚠️  Requires hostPath access to /etc/kubernetes/pki (cluster mode) and / (node mode)
+
+templates/tests/test-metrics.yaml
+yaml
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "k8s-health.fullname" . }}-test
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: curl
+      image: curlimages/curl:8.7.1
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          {{- if .Values.cluster.enabled }}
+          curl -sf http://{{ include "k8s-health.fullname" . }}-cluster:{{ .Values.cluster.port }}/metrics | grep -q "k8s_health_node_ready"
+          echo "✅ cluster exporter OK"
+          {{- end }}
+
+🔨 بخش E: Build و Deploy
+۱. Build image
+bash
+
+# از پوشه‌ی k8s-health/
+make build IMAGE=ghcr.io/your-org/k8s-health TAG=1.0.0
+make push  IMAGE=ghcr.io/your-org/k8s-health TAG=1.0.0
+
+۲. Estefāde az RBAC خام (بدون Helm)
+bash
+
+kubectl apply -f rbac.yaml
+kubectl apply -f deployment-cluster.yaml
+kubectl apply -f daemonset-node.yaml
+kubectl -n k8s-monitoring port-forward svc/k8s-health-cluster 9876 &
+curl localhost:9876/metrics | grep -E "node_ready|readyz|kubelet_active|swap_active"
+
+۳. استقرار با Helm
+bash
+
+# نسخه lint
+helm lint chart/k8s-health
+
+# render محلی
+helm template k8s-health chart/k8s-health --debug > /tmp/render.yaml
+grep -E "kind:|name:" /tmp/render.yaml | head -40
+
+# نصب روی dev cluster
+helm upgrade --install k8s-health chart/k8s-health \
+  -n k8s-monitoring --create-namespace \
+  --set image.repository=ghcr.io/your-org/k8s-health \
+  --set image.tag=1.0.0 \
+  --set prometheusRule.enabled=true \
+  --set serviceMonitor.enabled=true \
+  --set serviceMonitor.labels.release=prometheus
+
+# نصب در چند کلاستر (multi-context)
+for ctx in prod-us prod-eu staging; do
+  helm upgrade --install k8s-health chart/k8s-health \
+    --kube-context "$ctx" \
+    -n k8s-monitoring --create-namespace \
+    --set image.repository=ghcr.io/your-org/k8s-health \
+    --set prometheusRule.enabled=true
+done
+
+# تست Helm
+helm test k8s-health -n k8s-monitoring
+
+# uninstall
+helm uninstall k8s-health -n k8s-monitoring
+
+۴. تنظیم Prometheus scrape (اگر ServiceMonitor داری، خودکار است)
+yaml
+
+# در prometheus.yml — جایگزین static_configs
+- job_name: k8s-health
+  kubernetes_sd_configs:
+    - role: pod
+      namespaces:
+        names: [k8s-monitoring]
+  relabel_configs:
+    - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+      regex: k8s-health
+      action: keep
+    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+      action: replace
+      target_label: __address__
+      regex: (.+)
+      replacement: ${1}
+
+✅ بخش F: Verification & Troubleshooting
+چک‌لیست پس از استقرار
+bash
+
+# ۱. همه منابع ساخته شده‌اند
+kubectl -n k8s-monitoring get deploy,ds,svc,sa
+kubectl get clusterrole,clusterrolebinding | grep k8s-health
+
+# ۲. Pods بالا آمده‌اند
+kubectl -n k8s-monitoring get pods -o wide
+# انتظار: cluster (1/1) + node (N/N روی همه نودها)
+
+# ۳. لاگ بدون error
+kubectl -n k8s-monitoring logs -l app.kubernetes.io/component=cluster --tail=20
+kubectl -n k8s-monitoring logs -l app.kubernetes.io/component=node --tail=20
+
+# ۴. Metrics در دسترس
+kubectl -n k8s-monitoring port-forward svc/k8s-health-cluster 9876:9876 &
+curl -s localhost:9876/metrics | grep -E "^k8s_health_" | head -20
+
+# ۵. RBAC صحیح
+kubectl auth can-i list pods --as=system:serviceaccount:k8s-monitoring:k8s-health
+# باید yes
+
+# ۶. cert-check کار می‌کند (cluster mode)
+kubectl -n k8s-monitoring exec deploy/k8s-health-cluster -- \
+  ls /host/etc/kubernetes/pki/*.crt | head -3
+
+# ۷. host check کار می‌کند (node mode)
+NODE_POD=$(kubectl -n k8s-monitoring get pods -l app.kubernetes.io/component=node -o jsonpath='{.items[0].metadata.name}')
+kubectl -n k8s-monitoring exec "$NODE_POD" -- cat /host/proc/swaps
+
+عیب‌یابی رایج
+مشکل	علت	رفع
+cluster pod در Pending	روی master time-scheduling نشده	cluster.scheduleOnControlPlane: false + nodeSelector
+kubectl not found در pod	image-build ناقص	docker build را از پوشه‌ی صحیح اجرا کن
+permission denied روی /host	readOnlyRootFilesystem: true OK، اما hostPath mount اشتباه	readOnly: true روی volumeMount + type: Directory
+hostPID fail	PodSecurity admission	namespace را با pod-security.kubernetes.io/enforce: privileged label کن، یا baseline معادل با runAsUser: 0
+cert metric خالی	hostPath /etc/kubernetes/pki mount نشده	cluster.pkiHostPath را چک کن
+kubelet_active = 0	hostPID غیرفعال	node.hostPID: true (پیش‌فرض است)
+K8sHealthExporterDown	Prometheus نمی‌تواند scrape کند	NetworkPolicy، ServiceMonitor selector، namespace
+helm test fail	image در registry نیست	docker login + push کن
+drift بین cluster و node	label نود اشتباه	sum by (node)(k8s_health_disk_usage_ratio) را چک کن
+نکته‌ی امنیتی
+
+    DaemonSet با hostPID: true = دسترسی کامل به processهای نود. تنها در namespaceهای کنترل‌شده اجرا کن. readOnlyRootFilesystem: true + capabilities.drop: [ALL] + allowPrivilegeEscalation: false را حتماً داشته باش.
+
+    ClusterRole read-only — هیچ permission نوشتنی نداشته باش به‌جز pods/exec که برای etcd check لازم است. اگر می‌خواهی این را هم حذف کنی، check_etcd را غیرفعال کن (در values: etcdCheck: false — این پارامتر را می‌توانی بعداً اضافه کنی).
+
+    NetworkPolicy — پورت 9876/9877 را فقط از namespace مانیتورینگ باز بگذار:
+    yaml
+
+    networkPolicy:
+      enabled: true
+      prometheusNamespaceSelector:
+        matchLabels: {kubernetes.io/metadata.name: monitoring}
+
+🎯 جدول مقایسه‌ی دو مسیر
+ویژگی	RBAC خام + Manifest	Helm Chart
+سرعت راه‌اندازی	⚡ ۳۰ ثانیه	~۲ دقیقه
+چند-کلاستر	دستی	--kube-context
+نسخه‌بندی	دستی	helm history
+Rollback	kubectl apply قبلی	helm rollback
+Values override	sed	--set / -f prod.yaml
+ServiceMonitor/Rule	دستی	خودکار (values toggle)
+Alertmanager config	دستی	به‌صورت Secret تولید می‌شود
+تست	دستی	helm test
+
+توصیه: RBAC خام را برای تست dev استفاده کن، Helm Chart را در production با --kube-context روی همه کلاسترها.
+🚀 Workflow نهایی (Production)
+bash
+
+# ۱. در CI — build و push
+make build push IMAGE=ghcr.io/your-org/k8s-health TAG=$(git rev-parse --short HEAD)
+
+# ۲. helm lint در PR
+helm lint chart/k8s-health --strict
+
+# ۳. تست در dev
+helm upgrade --install k8s-health chart/k8s-health \
+  --kube-context dev -n k8s-monitoring --create-namespace \
+  -f values-dev.yaml
+
+# ۴. roll-out prod (canary)
+helm upgrade --install k8s-health chart/k8s-health \
+  --kube-context prod -n k8s-monitoring --create-namespace \
+  -f values-prod.yaml --wait --timeout 5m
+
+# ۵. verify
+helm test k8s-health --kube-context prod -n k8s-monitoring
+kubectl --context prod -n k8s-monitoring get pods
+curl -s http://prometheus/api/v1/query?query='up{job="k8s-health"}'
+
+

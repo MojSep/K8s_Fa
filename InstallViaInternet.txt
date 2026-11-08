@@ -1,0 +1,1081 @@
+﻿🏗️ راهنمای جامع نصب کوبرنتیز در محیط Production (Master + Worker)
+
+    روش استاندارد صنعتی: kubeadm + containerd + Calico/Cilium روی Ubuntu 22.04 LTS. تمام مراحل با دستور، مسیر دانلود و چک اعتبارسنجی.
+
+📋 بخش ۰: پیش‌نیازها و معماری
+۰.۱ — Topology نمونه (HA-ready)
+نقش	Hostname	IP	حداقل منابع
+Control Plane 1	master1	10.0.0.10	2 vCPU / 4GB / 50GB SSD
+Control Plane 2	master2	10.0.0.11	2 vCPU / 4GB / 50GB SSD
+Control Plane 3	master3	10.0.0.12	2 vCPU / 4GB / 50GB SSD
+Worker 1	worker1	10.0.0.20	4 vCPU / 8GB / 100GB SSD
+Worker 2	worker2	10.0.0.21	4 vCPU / 8GB / 100GB SSD
+VIP (Keepalived)	k8s-api	10.0.0.100	— (virtual)
+
+    چرا ۳ master؟ etcd برای حفظ quorum به اکثریت نیاز دارد. ۳ نود = تحمل ۱ خرابی. ۱ master = SPOF (نقطه‌ی شکست).
+
+۰.۲ — نسخه‌ها (Nov 2024)
+مؤلفه	نسخه	لینک
+Kubernetes	v1.31.x (آخرین stable)	https://kubernetes.io/releases/
+containerd	1.7.22+	https://github.com/containerd/containerd/releases
+runc	1.1.14+	https://github.com/opencontainers/runc/releases
+CNI plugins	1.5.1+	https://github.com/containernetworking/plugins/releases
+crictl	1.31.1+	https://github.com/kubernetes-sigs/cri-tools/releases
+Calico	3.28.x	https://github.com/projectcalico/calico/releases
+etcd	3.5.x (bundled)	https://github.com/etcd-io/etcd/releases
+۰.۳ — لیست چک پیش از شروع
+text
+
+[ ] همه نودها Ubuntu 22.04 LTS
+[ ] SSH root یا sudo بدون password به همه نودها
+[ ] hostname یکتا تنظیم شده
+[ ] /etc/hosts شامل همه نودها
+[ ] NTP فعال (chrony/systemd-timesyncd) — اختلاف زمان < 500ms
+[ ] پورت‌های لازم باز (جدول ۱.۴)
+[ ] swap غیرفعال
+[ ] تبادل SSH key بین نودها (برای SCP در HA)
+
+🔧 بخش ۱: آماده‌سازی سیستم‌عامل (روی همه نودها)
+۱.۱ — تنظیم hostname و hosts
+bash
+
+# روی master1:
+hostnamectl set-hostname master1
+# روی master2:  hostnamectl set-hostname master2
+# روی master3:  hostnamectl set-hostname master3
+# روی worker1:  hostnamectl set-hostname worker1
+# روی worker2:  hostnamectl set-hostname worker2
+
+# روی همه نودها — /etc/hosts:
+cat >> /etc/hosts <<EOF
+10.0.0.10  master1
+10.0.0.11  master2
+10.0.0.12  master3
+10.0.0.20  worker1
+10.0.0.21  worker2
+10.0.0.100 k8s-api
+EOF
+
+# ✅ چک:
+hostname                                    # باید master1/worker1/... باشد
+getent hosts master1 worker1 k8s-api        # باید IP برگرداند
+ping -c 2 master2                           # باید resolve کند
+
+۱.۲ — همگام‌سازی زمان (NTP)
+bash
+
+apt-get update && apt-get install -y chrony
+systemctl enable --now chrony
+
+# ✅ چک:
+chronyc tracking | grep -E "Leap status|System time"
+# انتظار: Leap status : Normal  +  System time : 0.000xxx seconds
+timedatectl | grep "System clock synchronized: yes"
+
+🔧 دلیل فنی: etcd حساس به clock skew است. اختلاف > 500ms باعث خطای lost leader یا request timeout می‌شود. kubelet هم با TLS cert not yet valid (اگر ساعت عقب باشد) fail می‌کند.
+۱.۳ — غیرفعال کردن swap
+bash
+
+swapoff -a
+sed -i '/\sswap\s/ s/^/#/' /etc/fstab
+
+# ✅ چک:
+swapon --show                  # باید خالی باشد
+free -h | grep -i swap         # Swap: 0B 0B 0B
+
+🔧 دلیل فنی: kubelet با failSwapOn: true (پیش‌فرض) اگر swap فعال باشد، کاملاً متوقف می‌شود. scheduler نمی‌تواند memory QoS را تضمین کند وقتی swap هست.
+۱.۴ — ماژول‌های Kernel
+bash
+
+cat > /etc/modules-load.d/k8s.conf <<EOF
+overlay
+br_netfilter
+EOF
+
+modprobe overlay
+modprobe br_netfilter
+
+# ✅ چک:
+lsmod | grep -E "^overlay|^br_netfilter"
+# انتظار: overlay ... (size) N ; br_netfilter ...
+
+۱.۵ — پارامترهای Sysctl
+bash
+
+cat > /etc/sysctl.d/99-kubernetes-cri.conf <<EOF
+# Networking
+net.bridge.bridge-nf-call-iptables   = 1
+net.bridge.bridge-nf-call-ip6tables  = 1
+net.ipv4.ip_forward                  = 1
+net.ipv4.conf.all.forwarding         = 1
+
+# Conntrack (production: کلاستر با > 1000 pod)
+net.netfilter.nf_conntrack_max       = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+
+# inotify (K8s از fsnotify برای watch استفاده می‌کند)
+fs.inotify.max_user_watches         = 1048576
+fs.inotify.max_user_instances       = 1024
+
+# file descriptors
+fs.file-max                         = 2097152
+
+# ARP table (کلاستر بزرگ)
+net.ipv4.neigh.default.gc_thresh1   = 4096
+net.ipv4.neigh.default.gc_thresh2   = 8192
+net.ipv4.neigh.default.gc_thresh3   = 16384
+
+# performance
+vm.swappiness                       = 0
+vm.overcommit_memory                = 1
+vm.panic_on_oom                     = 0
+kernel.panic                        = 10
+kernel.panic_on_oops                = 1
+EOF
+
+sysctl --system
+
+# ✅ چک:
+sysctl net.ipv4.ip_forward
+# انتظار: net.ipv4.ip_forward = 1
+sysctl net.bridge.bridge-nf-call-iptables
+# انتظار: = 1
+sysctl net.netfilter.nf_conntrack_max
+# انتظار: = 1048576
+
+🔧 دلیل فنی:
+
+    ip_forward=1: بدون آن، ترافیک بین podها route نمی‌شود.
+
+    bridge-nf-call-iptables=1: بدون آن، kube-proxy iptables روی bridge اعمال نمی‌شود → سرویس‌ها dead.
+
+    nf_conntrack_max: 65536 پیش‌فرض برای کلاسترهای > 500 pod کافی نیست → nf_conntrack: table full, dropping packet در dmesg.
+
+۱.۶ — فایروال (اگر UFW/iptables فعال است)
+bash
+
+# اگر UFW فعال است:
+ufw allow 6443/tcp                    # API Server
+ufw allow 2379:2380/tcp               # etcd (server + peer)
+ufw allow 10250/tcp                   # kubelet API
+ufw allow 10259/tcp                   # kube-scheduler
+ufw allow 10257/tcp                   # kube-controller-manager
+ufw allow 30000:32767/tcp             # NodePort services
+# برای CNI:
+ufw allow 4789/udp                    # Calico VXLAN
+ufw allow 179/tcp                     # Calico BGP (اگر BGP mode)
+ufw allow 8472/udp                    # Flannel VXLAN
+ufw allow 4240/tcp                    # Cilium health
+ufw allow 8472/udp                    # Cilium VXLAN
+ufw allow from 10.0.0.0/24 to any     # ترافیک بین‌نودی (pod network)
+
+# اگر firewalld (RHEL/Rocky):
+# firewall-cmd --permanent --add-port=6443/tcp ... && firewall-cmd --reload
+
+جدول پورت‌های حیاتی:
+پورت	پروتکل	کاربرد	کجا
+6443	TCP	kube-apiserver	master
+2379-2380	TCP	etcd	master
+10250	TCP	kubelet API	همه
+10257	TCP	controller-manager	master
+10259	TCP	scheduler	master
+30000-32767	TCP	NodePort services	همه
+4789	UDP	Calico VXLAN	همه
+179	TCP	Calico BGP (اگر BGP mode)	همه
+۱.۷ — بارگذاری ماژول‌های اضافی (اگر RHEL/Rocky)
+bash
+
+# Ubuntu معمولاً ندارد، RHEL دارد:
+modprobe nf_conntrack
+modprobe ip_conntrack
+cat >> /etc/modules-load.d/k8s.conf <<EOF
+nf_conntrack
+ip_conntrack
+EOF
+
+📦 بخش ۲: نصب Container Runtime (containerd) — روی همه نودها
+۲.۱ — دانلود و نصب containerd
+bash
+
+# نسخه پایدار — بررسی آخرین نسخه:
+# https://github.com/containerd/containerd/releases
+CONTAINERD_VERSION="1.7.22"
+
+# معماری:
+ARCH=$(dpkg --print-architecture)   # amd64 | arm64
+
+cd /tmp
+wget https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz
+
+# checksum (بسیار مهم برای production):
+wget https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz.sha256sum
+sha256sum -c containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz.sha256sum
+# انتظار: OK
+
+tar Cxzvf /usr/local containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz
+
+# ✅ چک:
+/usr/local/bin/containerd --version
+# انتظار: containerd github.com/containerd/containerd v1.7.22 ...
+
+۲.۲ — نصب runc (اجزای اجرای کانتینر)
+bash
+
+# https://github.com/opencontainers/runc/releases
+RUNC_VERSION="v1.1.14"
+wget https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.${ARCH}
+install -m 755 runc.${ARCH} /usr/local/sbin/runc
+
+# ✅ چک:
+runc --version
+# انتظار: runc version 1.1.14
+
+۲.۳ — نصب CNI plugins (برای networking پایه)
+bash
+
+# https://github.com/containernetworking/plugins/releases
+CNI_VERSION="v1.5.1"
+mkdir -p /opt/cni/bin
+wget https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${ARCH}-${CNI_VERSION}.tgz
+tar Cxzvf /opt/cni/bin cni-plugins-linux-${ARCH}-${CNI_VERSION}.tgz
+
+# ✅ چک:
+ls /opt/cni/bin/
+# انتظار: bridge, host-local, loopback, portmap, tuning, vlan, ...
+
+۲.۴ — نصب systemd unit برای containerd
+bash
+
+mkdir -p /usr/local/lib/systemd/system
+cat > /usr/local/lib/systemd/system/containerd.service <<'EOF'
+[Unit]
+Description=containerd container runtime
+Documentation=https://containerd.io
+After=network.target local-fs.target
+
+[Service]
+ExecStartPre=-/sbin/modprobe overlay
+ExecStart=/usr/local/bin/containerd
+Type=notify
+Delegate=yes
+KillMode=process
+Restart=always
+RestartSec=5
+LimitNPROC=infinity
+LimitCORE=infinity
+LimitNOFILE=infinity
+TasksMax=infinity
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now containerd
+
+# ✅ چک:
+systemctl is-active containerd
+# انتظار: active
+systemctl status containerd --no-pager | grep "Active:"
+# انتظار: Active: active (running)
+
+۲.۵ — پیکربندی containerd برای Kubernetes
+bash
+
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+
+# اعمال تنظیمات حیاتی با sed:
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sed -i 's|sandbox_image = ".*"|sandbox_image = "registry.k8s.io/pause:3.10"|' /etc/containerd/config.toml
+
+# ✅ چک نهایی:
+grep -E "SystemdCgroup|sandbox_image" /etc/containerd/config.toml
+# انتظار:
+#   SystemdCgroup = true
+#   sandbox_image = "registry.k8s.io/pause:3.10"
+
+🔧 نکته حیاتی: SystemdCgroup = true باید با cgroupDriver: systemd در kubelet هماهنگ باشد. ناسازگاری = OOMKilled تصادفی + memory limit بی‌اثر.
+۲.۶ — نصب crictl (ابزار دیباگ CRI)
+bash
+
+# https://github.com/kubernetes-sigs/cri-tools/releases
+CRICTL_VERSION="v1.31.1"
+wget https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${ARCH}.tar.gz
+tar zxvf crictl-${CRICTL_VERSION}-linux-${ARCH}.tar.gz -C /usr/local/bin
+
+# پیکربندی برای صحبت با containerd:
+cat > /etc/crictl.yaml <<EOF
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
+debug: false
+EOF
+
+# ✅ چک:
+crictl version
+# انتظار: Version: 0.1.0  RuntimeName: containerd  RuntimeVersion: 1.7.22
+crictl info | head -20
+crictl ps
+
+۲.۷ — ری‌استارت نهایی و تست integration
+bash
+
+systemctl restart containerd kubelet 2>/dev/null || systemctl restart containerd
+
+# ✅ تست end-to-end:
+crictl pull registry.k8s.io/pause:3.10
+# انتظار: Image is up to date for sha256:...
+
+crictl images | grep pause
+# انتظار: registry.k8s.io/pause   3.10   ...   ...
+
+☸️ بخش ۳: نصب kubeadm, kubelet, kubectl — روی همه نودها
+۳.۱ — نصب از repository رسمی (روش توصیه‌شده)
+bash
+
+# پیش‌نیازها
+apt-get update
+apt-get install -y apt-transport-https ca-certificates curl gpg
+
+# کلید GPG رسمی
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | \
+  gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+# repository
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | \
+  tee /etc/apt/sources.list.d/kubernetes.list
+
+# نصب
+apt-get update
+apt-get install -y kubelet kubeadm kubectl
+apt-mark hold kubelet kubeadm kubectl
+
+# ✅ چک نسخه‌ها:
+kubeadm version
+# انتظار: kubeadm version: &version.Info{Major:"1", Minor:"31", ...}
+kubelet --version
+# انتظار: Kubernetes v1.31.x
+kubectl version --client
+# انتظار: Client Version: v1.31.x
+
+    چرا apt-mark hold؟ جلوگیری از apt upgrade ناخواسته که kubelet را با API server ناسازگار می‌کند و کلاستر را خراب می‌کند.
+
+۳.۲ — نصب دستی (اگر repo در دسترس نیست / air-gapped)
+bash
+
+K8S_VERSION="v1.31.2"
+cd /tmp
+
+# دانلود باینری‌ها از:
+# https://dl.k8s.io/release/v1.31.2/bin/linux/amd64/
+curl -LO "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/${ARCH}/kubeadm"
+curl -LO "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/${ARCH}/kubelet"
+curl -LO "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/${ARCH}/kubectl"
+
+# checksum
+curl -LO "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/${ARCH}/kubeadm.sha256"
+curl -LO "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/${ARCH}/kubelet.sha256"
+curl -LO "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/${ARCH}/kubectl.sha256"
+
+sha256sum --check kubeadm.sha256 kubelet.sha256 kubectl.sha256
+# انتظار: kubeadm: OK / kubelet: OK / kubectl: OK
+
+install -m 755 kubeadm kubelet kubectl /usr/local/bin/
+
+۳.۳ — تنظیم kubelet برای استفاده از containerd
+bash
+
+# kubeadm خودش این را در init تنظیم می‌کند، اما مطمئن شو:
+grep -r "cgroupDriver" /var/lib/kubelet/ 2>/dev/null
+# اگر خالی بود، در init بعدی تنظیم می‌شود
+
+systemctl enable kubelet
+# ⚠️ هنوز start نکن — kubeadm init خودش این کار را می‌کند
+
+۳.۴ — کشیدن پیش‌نیاز image‌ها (اختیاری ولی سریع‌تر)
+bash
+
+kubeadm config images pull --kubernetes-version=v1.31.2
+
+# ✅ چک:
+crictl images | grep -E "kube-|pause|etcd|coredns"
+# انتظار: kube-apiserver, kube-controller-manager, kube-scheduler,
+#         kube-proxy, pause, etcd, coredns, cni
+
+🎛️ بخش ۴: Initializing Control Plane (فقط روی master1)
+۴.۱ — فایل پیکربندی kubeadm (production-grade)
+bash
+
+cat > /etc/kubernetes/kubeadm-config.yaml <<EOF
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: 10.0.0.10
+  bindPort: 6443
+nodeRegistration:
+  name: master1
+  criSocket: unix:///run/containerd/containerd.sock
+  kubeletExtraArgs:
+    - name: node-ip
+      value: "10.0.0.10"
+bootstrapTokens:
+  - groups: [system:bootstrappers:kubeadm:default-node-token]
+    token: "abcdef.0123456789abcdef"
+    ttl: 24h0m0s
+    usages: [signing, authentication]
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v1.31.2
+clusterName: k8s-prod
+controlPlaneEndpoint: "k8s-api:6443"        # VIP برای HA
+networking:
+  serviceSubnet: "10.96.0.0/12"
+  podSubnet: "10.244.0.0/16"
+  dnsDomain: "cluster.local"
+apiServer:
+  certSANs:
+    - "k8s-api"
+    - "10.0.0.100"
+    - "master1"
+    - "10.0.0.10"
+    - "master2"
+    - "10.0.0.11"
+    - "master3"
+    - "10.0.0.12"
+    - "127.0.0.1"
+  extraArgs:
+    - name: enable-admission-plugins
+      value: "NodeRestriction,PodSecurity"
+    - name: audit-log-path
+      value: "/var/log/kubernetes/audit.log"
+    - name: audit-log-maxage
+      value: "30"
+    - name: audit-log-maxbackup
+      value: "10"
+    - name: audit-log-maxsize
+      value: "100"
+    - name: audit-policy-file
+      value: "/etc/kubernetes/audit-policy.yaml"
+    - name: authorization-mode
+      value: "Node,RBAC"
+  extraVolumes:
+    - name: audit-policy
+      hostPath: /etc/kubernetes/audit-policy.yaml
+      mountPath: /etc/kubernetes/audit-policy.yaml
+      readOnly: true
+    - name: audit-logs
+      hostPath: /var/log/kubernetes
+      mountPath: /var/log/kubernetes
+controllerManager:
+  extraArgs:
+    - name: bind-address
+      value: "0.0.0.0"
+    - name: cluster-signing-duration
+      value: "87600h"                     # 10 سال برای CA
+scheduler:
+  extraArgs:
+    - name: bind-address
+      value: "0.0.0.0"
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+    extraArgs:
+      - name: listen-metrics-urls
+        value: "http://0.0.0.0:2381"
+      - name: quota-backend-bytes
+        value: "8589934592"               # 8GB
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+authentication:
+  anonymous:
+    enabled: false
+  webhook:
+    enabled: true
+  x509:
+    clientCAFile: /etc/kubernetes/pki/ca.crt
+authorization:
+  mode: Webhook
+clusterDomain: cluster.local
+rotateCertificates: true
+serverTLSBootstrap: true
+staticPodPath: /etc/kubernetes/manifests
+evictionHard:
+  memory.available: "100Mi"
+  nodefs.available: "10%"
+  imagefs.available: "15%"
+EOF
+
+فایل audit policy (کنار config):
+bash
+
+cat > /etc/kubernetes/audit-policy.yaml <<EOF
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  # لاگ کامل برای عملیات حساس
+  - level: RequestResponse
+    verbs: [create, update, patch, delete]
+    resources:
+      - group: ""
+        resources: [pods, secrets, serviceaccounts]
+      - group: "rbac.authorization.k8s.io"
+        resources: ["*"]
+  # لاگ metadata برای بقیه
+  - level: Metadata
+    omitStages: [RequestReceived]
+    resources:
+      - group: ""
+      - group: "apps"
+      - group: "batch"
+  # نادیده گرفتن health check
+  - level: None
+    users: [system:kube-proxy]
+    verbs: [watch]
+    resources:
+      - group: ""
+        resources: [endpoints, services]
+  - level: None
+    nonResourceURLs: [/healthz*, /livez*, /readyz*]
+EOF
+
+mkdir -p /var/log/kubernetes
+
+۴.۲ — اجرای init
+bash
+
+# اگر kubelet هنوز فعال نیست:
+systemctl enable --now kubelet
+
+# اجرای init با dry-run اول (بسیار مهم):
+kubeadm init --config=/etc/kubernetes/kubeadm-config.yaml --dry-run
+
+# اگر dry-run موفق بود:
+kubeadm init --config=/etc/kubernetes/kubeadm-config.yaml --upload-certs 2>&1 | tee /root/kubeadm-init.log
+
+پارامترهای مهم:
+
+    --upload-certs: گواهی‌های CA را در ConfigMap کلاستر upload می‌کند تا masterهای دیگر بدون کپی دستی join شوند.
+
+    --dry-run: اگر خطا داشت، فقط نمایش می‌دهد و تغییر نمی‌دهد.
+
+۴.۳ — پیام موفقیت
+
+باید خروجی مثل این ببینی:
+text
+
+Your Kubernetes control-plane has initialized successfully!
+
+To start using your cluster, you need to run the following as a regular user:
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+You should now deploy a pod network to the cluster.
+Run "kubectl apply -f [podnetwork].yaml" with one of the options listed at:
+  https://kubernetes.io/docs/concepts/cluster-administration/addons/
+
+You can now join any number of control-plane nodes by copying certificate authorities
+and service account keys on each node and then running the following as root:
+
+  kubeadm join k8s-api:6443 --token abcdef.0123456789abcdef \
+    --discovery-token-ca-cert-hash sha256:... \
+    --control-plane --certificate-key ...
+
+Then you can join any number of worker nodes by running the following on each as root:
+
+  kubeadm join k8s-api:6443 --token abcdef.0123456789abcdef \
+    --discovery-token-ca-cert-hash sha256:...
+
+    ⚠️ فوری: هر دو دستور join را در جای امن کپی کن. توکن ۲۴ ساعت اعتبار دارد. اگر منقضی شد: kubeadm token create --print-join-command.
+
+۴.۴ — کپی kubeconfig برای کاربر
+bash
+
+mkdir -p $HOME/.kube
+cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+chown $(id -u):$(id -g) $HOME/.kube/config
+chmod 600 $HOME/.kube/config
+
+# ✅ چک:
+kubectl get nodes
+# انتظار: master1  NotReady  control-plane  ...
+# ⚠️ NotReady طبیعی است — CNI نصب نشده
+
+kubectl get pods -n kube-system
+# انتظار: kube-apiserver, etcd, kube-scheduler, kube-controller-manager = Running
+#         coredns = Pending
+#         kube-proxy = Running
+
+۴.۵ — چک‌های سلامت Control Plane
+bash
+
+# static pods همه Running؟
+kubectl get pods -n kube-system -l tier=control-plane
+
+# API Server responsive؟
+kubectl get --raw='/readyz?verbose' | tail -1
+# انتظار: readyz check passed
+
+# etcd healthy؟
+kubectl -n kube-system exec etcd-master1 -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint health
+# انتظار: https://127.0.0.1:2379 is healthy: successfully committed proposal
+
+# certificate ها؟
+kubeadm certs check-expiration
+# انتظار: همه > 1 سال
+
+# API latency
+time kubectl get --raw=/healthz
+# انتظار: < 100ms
+
+🌐 بخش ۵: نصب CNI (روی master1)
+۵.۱ — انتخاب CNI
+CNI	مناسب برای	ویژگی
+Calico	Production عمومی	NetworkPolicy, BGP, eBPF (Tigera)
+Cilium	High-perf, eBPF	Observability (Hubble), kube-proxy-less
+Flannel	تیم‌های کوچک	ساده، بدون NetworkPolicy
+Weave	dev	deprecated recommended نیست
+
+توصیه: Calico با VXLAN یا Cilium.
+۵.۲ — نصب Calico
+bash
+
+# نسخه:
+CALICO_VERSION="v3.28.2"
+
+# دانلود manifest:
+curl -LO https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml
+curl -LO https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/custom-resources.yaml
+
+# ⚠️ مهم: podSubnet را با kubeadm-config هماهنگ کن
+grep -A2 "cidr:" custom-resources.yaml
+# اگر 192.168.0.0/16 است ولی kubeadm بالا 10.244.0.0/16:
+sed -i 's|192.168.0.0/16|10.244.0.0/16|g' custom-resources.yaml
+
+# نصب:
+kubectl create -f tigera-operator.yaml
+# منتظر بمان تا operator ready شود:
+kubectl -n tigera-operator wait --for=condition=Available deploy/tigera-operator --timeout=5m
+
+kubectl create -f custom-resources.yaml
+
+# نظارت بر rollout:
+kubectl -n calico-system rollout status ds/calico-node --timeout=5m
+kubectl -n calico-system get pods
+
+۵.۳ — چک CNI
+bash
+
+# همه calico pods Running؟
+kubectl -n calico-system get pods
+# انتظار: calico-node-xxxx (روی هر نود), calico-kube-controllers, calico-typha
+
+# نود Ready شد؟
+kubectl get nodes
+# انتظار: master1   Ready   control-plane   ...
+
+# IP پادها از podSubnet است؟
+kubectl run test-pod --rm -it --image=busybox --restart=Never -- ip addr show
+# انتظار: inet 10.244.x.x/...
+
+# تست network policy:
+kubectl get networkpolicies -A
+# انتظار: خالی (هنوز هیچ policy ای نصب نشده)
+
+🖥️ بخش ۶: Join کردن Master های دیگر (HA) — روی master2 و master3
+۶.۱ — پیش‌نیاز
+
+روی master2 و master3، بخش‌های ۱ تا ۳ را کامل انجام بده (OS prep + containerd + kubeadm). سپس:
+۶.۲ — اجرای join
+bash
+
+# از خروجی kubeadm init در master1:
+kubeadm join k8s-api:6443 --token abcdef.0123456789abcdef \
+  --discovery-token-ca-cert-hash sha256:... \
+  --control-plane --certificate-key ... \
+  --apiserver-advertise-address=10.0.0.11 \
+  --node-name=master2
+
+    ⚠️ --apiserver-advertise-address باید IP همان نود باشد (master2 → 10.0.0.11، master3 → 10.0.0.12). --certificate-key فقط برای --control-plane است.
+
+۶.۳ — چک پس از join
+bash
+
+# روی master1:
+kubectl get nodes
+# انتظار:
+#   master1   Ready   control-plane   ...
+#   master2   Ready   control-plane   ...
+#   master3   Ready   control-plane   ...
+
+# همه etcd members درست؟
+kubectl -n kube-system exec etcd-master1 -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  member list -w table
+
+# انتظار: ۳ عضو، همه started, یکی isLeader=true
+
+# leader election
+kubectl -n kube-system get lease kube-scheduler -o jsonpath='{.spec.holderIdentity}'
+kubectl -n kube-system get lease kube-controller-manager -o jsonpath='{.spec.holderIdentity}'
+
+۶.۴ — راه‌اندازی VIP با Keepalived (برای HA)
+
+روی هر ۳ master:
+bash
+
+apt-get install -y keepalived
+
+# master1 = MASTER, master2/3 = BACKUP
+cat > /etc/keepalived/keepalived.conf <<EOF
+vrrp_script check_apiserver {
+  script "/etc/keepalived/check_apiserver.sh"
+  interval 3
+  weight -2
+  fall 10
+  rise 2
+}
+
+vrrp_instance VI_1 {
+  state MASTER                     # روی master2/3 → BACKUP
+  interface eth0                   # نام interface
+  virtual_router_id 51
+  priority 101                     # master1=101, master2=100, master3=99
+  advert_int 1
+  authentication {
+    auth_type PASS
+    auth_pass K8sHA_2024
+  }
+  virtual_ipaddress {
+    10.0.0.100/24
+  }
+  track_script {
+    check_apiserver
+  }
+}
+EOF
+
+cat > /etc/keepalived/check_apiserver.sh <<'EOF'
+#!/bin/bash
+errorExit() { echo "*** $*" 1>&2; exit 1; }
+curl -sf --max-time 2 https://localhost:6443/healthz >/dev/null || errorExit "API down"
+EOF
+chmod +x /etc/keepalived/check_apiserver.sh
+
+systemctl enable --now keepalived
+
+# ✅ چک:
+ip addr show eth0 | grep 10.0.0.100
+# انتظار: روی master1 (MASTER) دیده می‌شود
+curl -k https://10.0.0.100:6443/healthz
+# انتظار: ok
+
+🖥️ بخش ۷: Join کردن Worker Nodes — روی worker1 و worker2
+۷.۱ — پیش‌نیاز
+
+بخش‌های ۱ تا ۳ را روی worker کامل انجام بده.
+۷.۲ — join
+bash
+
+# از خروجی init در master1:
+kubeadm join k8s-api:6443 --token abcdef.0123456789abcdef \
+  --discovery-token-ca-cert-hash sha256:...
+
+۷.۳ — چک
+bash
+
+# روی master1:
+kubectl get nodes
+# انتظار:
+#   master1   Ready   control-plane   ...
+#   master2   Ready   control-plane   ...
+#   master3   Ready   control-plane   ...
+#   worker1   Ready   <none>          ...
+#   worker2   Ready   <none>          ...
+
+# لیبل workerها:
+kubectl label node worker1 node-role.kubernetes.io/worker=worker
+kubectl label node worker2 node-role.kubernetes.io/worker=worker
+
+# چک podهای سیستمی روی worker:
+kubectl get pods -A -o wide | grep worker1
+# انتظار: calico-node-xxx, kube-proxy-xxx = Running
+
+🔍 بخش ۸: چک نهایی سلامت کلاستر
+۸.۱ — اسکریپت جامع
+bash
+
+cat > /root/k8s-health-check.sh <<'EOF'
+#!/bin/bash
+echo "═══ Kubernetes Cluster Health ═══"
+echo ""
+echo "── Nodes ──"
+kubectl get nodes -o wide
+echo ""
+echo "── Control Plane Pods ──"
+kubectl get pods -n kube-system | grep -E "etcd|apiserver|controller|scheduler"
+echo ""
+echo "── CNI Pods ──"
+kubectl get pods -n calico-system 2>/dev/null || kubectl get pods -n kube-system | grep -E "calico|cilium|flannel"
+echo ""
+echo "── readyz ──"
+kubectl get --raw='/readyz' 2>&1
+echo ""
+echo "── etcd Health ──"
+kubectl -n kube-system exec etcd-master1 -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint health
+echo ""
+echo "── Certificates ──"
+kubeadm certs check-expiration | grep -E "CA|apiserver|etcd-server|admin"
+echo ""
+echo "── API Latency ──"
+time kubectl get --raw=/healthz
+echo ""
+echo "── All Pods Status ──"
+kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed"{print "❌ "$1"/"$2"="$4}' || echo "✅ ALL HEALTHY"
+EOF
+
+chmod +x /root/k8s-health-check.sh
+/root/k8s-health-check.sh
+
+۸.۲ — تست end-to-end با یک workload
+bash
+
+# Deployment + Service + Ingress تست
+kubectl create namespace demo
+kubectl -n demo create deployment nginx --image=nginx:alpine --replicas=3
+kubectl -n demo expose deployment nginx --port=80 --type=ClusterIP
+
+# چک:
+kubectl -n demo get pods,svc
+kubectl -n demo rollout status deployment nginx --timeout=120s
+# انتظار: deployment "nginx" successfully rolled out
+
+# تست دسترسی داخلی:
+kubectl -n demo run test-curl --rm -it --image=curlimages/curl:8.7.1 --restart=Never -- \
+  curl -s http://nginx.demo.svc.cluster.local | head -5
+# انتظار: <!DOCTYPE html> ...
+
+# تست DNS:
+kubectl -n demo run test-dns --rm -it --image=busybox:1.36 --restart=Never -- \
+  nslookup nginx.demo.svc.cluster.local
+# انتظار: Name: nginx.demo.svc.cluster.local
+
+# تست خارجی DNS:
+kubectl -n demo run test-ext --rm -it --image=busybox:1.36 --restart=Never -- \
+  nslookup google.com
+# انتظار: Name: google.com
+
+# پاکسازی:
+kubectl delete namespace demo
+
+۸.۳ — چک workload scheduling روی worker
+bash
+
+kubectl create deployment test-sched --image=nginx:alpine --replicas=4
+sleep 30
+kubectl get pods -o wide -l app=test-sched
+# انتظار: پادها روی worker1 و worker2 توزیع شده
+
+kubectl delete deployment test-sched
+
+🛡️ بخش ۹: Post-Install Production Hardening
+۹.۱ — Backup etcd (روزانه)
+bash
+
+mkdir -p /backup/etcd
+
+cat > /usr/local/bin/etcd-backup.sh <<'EOF'
+#!/bin/bash
+DATE=$(date +%Y%m%d-%H%M%S)
+BACKUP=/backup/etcd/etcd-${DATE}.db
+ETCDCTL_API=3 etcdctl snapshot save "$BACKUP" \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+ETCDCTL_API=3 etcdctl snapshot status "$BACKUP" -w table
+# حذف بکاپ‌های > 7 روز
+find /backup/etcd -name "*.db" -mtime +7 -delete
+EOF
+chmod +x /usr/local/bin/etcd-backup.sh
+
+# cron:
+cat > /etc/cron.d/etcd-backup <<EOF
+0 2 * * * root /usr/local/bin/etcd-backup.sh >> /var/log/etcd-backup.log 2>&1
+EOF
+
+# ✅ تست دستی:
+/usr/local/bin/etcd-backup.sh
+ls -lh /backup/etcd/
+
+۹.۲ — NetworkPolicy پیش‌فرض (default-deny)
+bash
+
+# ⚠️ قبل از اعمال، مطمئن شو NetworkPolicy ها را می‌فهمی
+cat > /root/default-deny.yaml <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+EOF
+
+# فقط در namespaceهای مشخص اعمال کن — نه kube-system
+# kubectl apply -f /root/default-deny.yaml
+
+۹.۳ — Pod Security Standards
+bash
+
+# برای namespaceهای production، PodSecurity restricted:
+kubectl label namespace production \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted
+
+# بررسی:
+kubectl get ns production -o jsonpath='{.metadata.labels}' | jq
+
+۹.۴ — Upgrade نودها (پس از نصب)
+bash
+
+# روی master1:
+apt-get update && apt-get install -y --allow-change-held-packages kubeadm=1.31.3-1.1
+kubeadm upgrade plan
+kubeadm upgrade apply v1.31.3
+
+# drain و upgrade kubelet روی هر نود:
+kubectl drain master1 --ignore-daemonsets
+apt-get install -y --allow-change-held-packages kubelet=1.31.3-1.1 kubectl=1.31.3-1.1
+systemctl daemon-reload && systemctl restart kubelet
+kubectl uncordon master1
+
+📊 بخش ۱۰: جدول چک‌های نصب (Checklist)
+مرحله	چک	دستور	انتظار
+OS	hostname	hostname	master1/worker1
+OS	hosts	getent hosts master1	IP برمی‌گردد
+OS	NTP	timedatectl | grep synchronized	yes
+OS	swap	swapon --show	خالی
+OS	modules	lsmod | grep overlay	لود شده
+OS	sysctl	sysctl net.ipv4.ip_forward	= 1
+Runtime	containerd	systemctl is-active containerd	active
+Runtime	cgroup	grep SystemdCgroup /etc/containerd/config.toml	true
+Runtime	CRI	crictl ps	کار می‌کند
+Tools	kubeadm	kubeadm version	v1.31.x
+Master init	static pods	kubectl get pods -n kube-system -l tier=control-plane	۴ Running
+Master init	readyz	kubectl get --raw=/readyz	ok
+Master init	etcd	etcdctl endpoint health	healthy
+Master init	certs	kubeadm certs check-expiration	> 1y
+HA	VIP	curl -k https://10.0.0.100:6443/healthz	ok
+CNI	calico	kubectl -n calico-system get pods	همه Running
+Nodes	Ready	kubectl get nodes	همه Ready
+Network	DNS داخلی	nslookup kubernetes.default	resolves
+Network	DNS خارجی	nslookup google.com	resolves
+Workload	deploy	kubectl create deploy + rollout status	successfully
+Backup	etcd	etcdctl snapshot status	کامل
+🚨 بخش ۱۱: عیب‌یابی خطاهای رایج نصب
+خطا	علت	راه‌حل
+kubeadm init → [ERROR Swap]: running with swap on is not supported	swap فعال	swapoff -a + کامنت /etc/fstab
+[ERROR FileContent--proc-sys-net-bridge-bridge-nf-call-iptables]	sysctl نبود	modprobe br_netfilter + sysctl -p
+[ERROR CRI]: container runtime is not running	containerd down یا socket اشتباه	systemctl status containerd + crictl ps
+[ERROR SystemVerification]: missing required cgroups: memory	cgroup v2 disabled (RHEL)	grubby --update-kernel=ALL --args="systemd.unified_cgroup_hierarchy=1"
+failed to get sandbox image	pause image pull fail	crictl pull registry.k8s.io/pause:3.10 یا mirror
+etcd member ... is not in the cluster	توکن قدیمی/دوباره	kubeadm reset -f + دوباره join
+node NotReady بعد از join	CNI نصب نشده	kubectl apply Calico/Cilium
+kubelet: failed to run Kubelet: unknown service runtime	criSocket اشتباه	/run/containerd/containerd.sock
+apiserver: x509: certificate signed by unknown authority	CA mismatch (join قدیمی)	kubeadm reset -f + دوباره join
+too many open files	LimitNOFILE low	ulimit -n 1048576 + systemd override
+unable to connect to the server: x509	kubeconfig expired	kubeadm certs renew all
+[ERROR Port-10250]: Port 10250 is in use	kubelet قدیمی در حال اجرا	systemctl stop kubelet قبل از init
+pods stuck in ContainerCreating	CNI pod روی نود fail	kubectl -n calico-system logs <pod>
+Multi-Attach error	RWO volume روی دو نود	پاد قدیمی را force-delete کن
+🎯 بخش ۱۲: خلاصه‌ی مسیر نصب
+text
+
+هر نود:
+├── ۱. OS prep        (hostname, hosts, NTP, swap off, kernel, sysctl, firewall)
+├── ۲. containerd     (دانلود، systemd unit، config.toml با SystemdCgroup)
+├── ۳. crictl         (کلاینت CRI)
+├── ۴. CNI plugins    (/opt/cni/bin)
+├── ۵. kubeadm/kubelet/kubectl   (از pkgs.k8s.io)
+└── ۶. systemctl enable kubelet
+
+master1:
+├── ۷. kubeadm-config.yaml
+├── ۸. audit-policy.yaml
+├── ۹. kubeadm init --upload-certs
+├── ۱۰. کپی kubeconfig
+├── ۱۱. نصب CNI (Calico/Cilium)
+└── ۱۲. چک سلامت (readyz, etcd, certs)
+
+master2/3:
+├── ۱۳. kubeadm join --control-plane --certificate-key
+└── ۱۴. keepalived برای VIP
+
+worker1/2:
+├── ۱۵. kubeadm join --token
+└── ۱۶. label worker
+
+Post-install:
+├── ۱۷. etcd backup cron
+├── ۱۸. NetworkPolicy default-deny (اختیاری)
+├── ۱۹. PodSecurity restricted
+├── ۲۰. helm 3 نصب + ArgoCD/GitOps
+└── ۲۱. مانیتورینگ (k8s-health exporter از پیام قبلی)
+
+📎 مسیرهای دانلود مرجع
+ابزار	لینک
+kubectl/kubeadm/kubelet	https://dl.k8s.io/release/stable.txt
+apt repo K8s	https://pkgs.k8s.io/
+containerd	https://github.com/containerd/containerd/releases
+runc	https://github.com/opencontainers/runc/releases
+CNI plugins	https://github.com/containernetworking/plugins/releases
+crictl	https://github.com/kubernetes-sigs/cri-tools/releases
+Calico	https://github.com/projectcalico/calico/releases
+Cilium	https://github.com/cilium/cilium/releases
+helm	https://github.com/helm/helm/releases
+etcdctl	https://github.com/etcd-io/etcd/releases
+
+    ⚡ توصیه نهایی: برای محیط production، بعد از نصب:
+    ۱. etcd-backup cron را فعال کن
+    ۲. k8s-health-exporter (از پیام قبلی) را روی همه نودها نصب کن
+    ۳. Alertmanager را به Slack/Telegram وصل کن
+    ۴. GitOps (ArgoCD/Flux) را جایگزین kubectl apply کن
+    ۵. kube-bench را برای CIS Benchmark اجرا کن: docker run --rm --pid=host -v /etc:/etc:ro -v /var:/var:ro aquasec/kube-bench:latest
+

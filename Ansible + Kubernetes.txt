@@ -1,0 +1,1817 @@
+﻿🔧 Ansible + Kubernetes — راهنمای جامع DevOps
+
+    Ansible در لایه زیرین Kubernetes می‌نشیند (provisioning، bootstrap، hardening، runtime config) و در لایه بالا برای cross-cluster orchestration و Day-2 operations استفاده می‌شود. جایگزین kubectl/Helm/ArgoCD نیست — مکمل آن‌هاست.
+
+🗺️ بخش ۱: جایگاه Ansible در اکوسیستم K8s
+۱.۱ — مرز مسئولیت‌ها
+text
+
+┌──────────────────────────────────────────────────────────────┐
+│ Layer 5: GitOps (ArgoCD/Flux)         ← Deploy declarative  │
+│   کد اپلیکیشن، Kustomize/Helm، Git as truth                 │
+├──────────────────────────────────────────────────────────────┤
+│ Layer 4: Helm / Kustomize              ← Packaging           │
+│   chart authoring، templating                                │
+├──────────────────────────────────────────────────────────────┤
+│ Layer 3: Ansible                       ← Day-2 Orchestration │
+│   ✓ Cross-cluster operations                                 │
+│   ✓ Bootstrap کلاستر (kubeadm)                               │
+│   ✓ OS hardening، runtime config                             │
+│   ✓ Install/upgrade components                               │
+│   ✓ DR restore، maintenance workflows                        │
+│   ✓ Backup automation                                        │
+│   ✗ NOT for app deploys (از GitOps استفاده کن)              │
+├──────────────────────────────────────────────────────────────┤
+│ Layer 2: Terraform/Pulumi              ← Infrastructure      │
+│   VPC، VM، LB، Managed K8s (EKS/GKE)                        │
+├──────────────────────────────────────────────────────────────┤
+│ Layer 1: kubectl                       ← Manual debug/ops    │
+└──────────────────────────────────────────────────────────────┘
+
+۱.۲ — چه چیزی Ansible را انتخاب می‌کند؟
+سناریو	Ansible؟	چرا
+ساخت EKS با Terraform	❌	Terraform state دارد
+نصب kubeadm روی ۱۰ نود	✅	idempotent، بدون state، SSH-based
+Deploy اپلیکیشن	❌	GitOps (ArgoCD) بهتر است
+Upgrade همه master ها	✅	workflow ترتیبی
+نصب Calico با values متفاوت per-cluster	✅	dynamic inventory
+روز-۲: renew certificate ها	✅	scheduling + SSH
+Backup etcd روی همه master ها	✅	cross-host orchestration
+DR restore کلاستر	✅	چند-مرحله‌ای با چک
+Node drain + upgrade + uncordon	✅	workflow با wait
+ConfigMap/Secret management	⚠️	External Secrets بهتر است
+Multi-cluster operations	✅	inventory-driven
+
+قانون طلایی: Ansible برای چیزی که در Git نباید باشد (secret، host-specific، یکبار)، GitOps برای چیزی که باید در Git باشد (app manifests).
+🔌 بخش ۲: روش‌های اتصال Ansible به Kubernetes
+۲.۱ — اتصال SSH (سنتی) + kubectl local
+text
+
+[Ansible Controller] ──SSH──▶ [master1] ──kubectl──▶ [API]
+                    ──SSH──▶ [master2] ──kubectl──▶ [API]
+
+yaml
+
+# inventory/hosts.yml
+all:
+  children:
+    control_plane:
+      hosts:
+        master1: {ansible_host: 10.0.0.10}
+        master2: {ansible_host: 10.0.0.11}
+        master3: {ansible_host: 10.0.0.12}
+      vars:
+        ansible_user: root
+        ansible_ssh_private_key_file: ~/.ssh/k8s_rsa
+    workers:
+      hosts:
+        worker1: {ansible_host: 10.0.0.20}
+        worker2: {ansible_host: 10.0.0.21}
+  vars:
+    kubernetes_version: "1.31.2"
+    pod_subnet: "10.244.0.0/16"
+    service_subnet: "10.96.0.0/12"
+
+مزیت: کنترل کامل روی هر نود، مناسب bootstrap.
+عیب: نیاز به SSH، کند برای operations متعدد.
+۲.۲ — اتصال مستقیم به API (k8s module)
+text
+
+[Ansible Controller] ──HTTPS/6443──▶ [kube-apiserver]
+
+yaml
+
+# tasks/deploy_app.yml
+- name: deploy nginx
+  kubernetes.core.k8s:
+    kubeconfig: /etc/kubernetes/admin.conf
+    state: present
+    namespace: default
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nginx
+      spec:
+        replicas: 3
+        selector:
+          matchLabels: {app: nginx}
+        template:
+          metadata:
+            labels: {app: nginx}
+          spec:
+            containers:
+              - name: nginx
+                image: nginx:1.27
+
+مزیت: سریع، بدون SSH به هر نود، مناسب cross-cluster.
+عیب: نیاز به admin.conf یا SA با RBAC، نماد imperative (نه Git).
+۲.۳ — اتصال In-Cluster (Ansible در Pod)
+text
+
+[Ansible Pod] ──ServiceAccount──▶ [API]
+
+yaml
+
+# K8s Deployment برای Ansible Controller
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ansible-controller
+  namespace: automation
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ansible}
+  template:
+    metadata:
+      labels: {app: ansible}
+    spec:
+      serviceAccountName: ansible
+      containers:
+        - name: ansible
+          image: quay.io/ansible/creator-ee:v24.6.0
+          command: ["sleep", "infinity"]
+          env:
+            - name: K8S_AUTH_KUBECONFIG
+              value: /var/run/secrets/kubernetes.io/serviceaccount/  # auto
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ansible
+  namespace: automation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ansible-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin   # ⚠️ در production محدود کن
+subjects:
+  - kind: ServiceAccount
+    name: ansible
+    namespace: automation
+
+مزیت: بدون نیاز به دسترسی از خارج کلاستر.
+عیب: اگر کلاستر خراب باشد، Ansible هم از دسترس خارج است (برای DR خوب نیست).
+۲.۴ — Inventory پویا (Dynamic Inventory)
+yaml
+
+# inventory/k8s_nodes.yml — از K8s API می‌خواند
+plugin: kubernetes.core.k8s
+kubeconfig: /etc/kubernetes/admin.conf
+connections:
+  - kube_conn:
+      namespaces: [default]
+      resources:
+        - kind: Node
+          label_selector: "kubernetes.io/hostname"
+      compose:
+        ansible_host: status.addresses[0].address
+        ansible_user: root
+      groups:
+        control_plane: >-
+          metadata.labels['node-role.kubernetes.io/control-plane'] is defined
+        workers: >-
+          metadata.labels['node-role.kubernetes.io/worker'] is defined
+
+مزیت: همیشه sync با واقعیت کلاستر.
+📚 بخش ۳: ماژول‌ها و Collection های کلیدی
+۳.۱ — Collection رسمی
+bash
+
+# نصب
+ansible-galaxy collection install kubernetes.core
+
+# نسخه
+ansible-galaxy collection list | grep kubernetes
+# انتظار: kubernetes.core  5.0.0
+
+۳.۲ — ماژول‌های پرکاربرد
+ماژول	کاربرد
+kubernetes.core.k8s	create/update/delete هر resource
+kubernetes.core.k8s_info	لیست/گرفتن resource
+kubernetes.core.k8s_exec	exec در pod
+kubernetes.core.k8s_log	لاگ pod
+kubernetes.core.k8s_scale	scale deployment
+kubernetes.core.k8s_drain	drain/cordon نود
+kubernetes.core.k8s_cp	copy فایل به/از pod
+kubernetes.core.helm	نصب/upgrade chart
+kubernetes.core.helm_repository	add repo
+kubernetes.core.helm_info	لیست releases
+kubernetes.core.helm_plugin	install helm plugin
+🎯 بخش ۴: Playbook های Production-Ready
+📄 ۴.۱ — ساختار پروژه
+text
+
+k8s-ansible/
+├── ansible.cfg
+├── requirements.yml
+├── inventory/
+│   ├── prod/
+│   │   ├── hosts.yml
+│   │   └── group_vars/
+│   │       ├── all.yml
+│   │       ├── control_plane.yml
+│   │       └── workers.yml
+│   └── staging/
+│       └── hosts.yml
+├── playbooks/
+│   ├── 01-bootstrap.yml
+│   ├── 02-add-node.yml
+│   ├── 03-upgrade.yml
+│   ├── 04-etcd-backup.yml
+│   ├── 05-etcd-restore.yml
+│   ├── 06-cert-renew.yml
+│   ├── 07-node-maintenance.yml
+│   ├── 08-audit-and-harden.yml
+│   └── 09-health-check.yml
+├── roles/
+│   ├── common/         # OS prep (swap, sysctl, modules)
+│   ├── containerd/
+│   ├── kube-tools/     # kubeadm/kubelet/kubectl
+│   ├── cni/            # Calico
+│   ├── k8s-ha/         # keepalived + haproxy
+│   └── k8s-hardening/  # CIS benchmark
+└── files/
+    ├── kubeadm-config.yaml.j2
+    └── calico-custom.yaml.j2
+
+📄 ansible.cfg
+ini
+
+[defaults]
+inventory = ./inventory/prod/hosts.yml
+roles_path = ./roles
+collections_path = ~/.ansible/collections:/usr/share/ansible/collections
+host_key_checking = False
+interpreter_python = auto_silent
+forks = 20
+strategy = linear
+stdout_callback = yaml
+callbacks_enabled = profile_tasks, timer
+log_path = ./logs/ansible.log
+retry_files_enabled = False
+deprecation_warnings = False
+
+[ssh_connection]
+pipelining = True
+control_path = /tmp/ansible-ssh-%%h-%%p-%%r
+ssh_args = -o ControlMaster=auto -o ControlPersist=60s -o PreferredAuthentications=publickey
+
+📄 requirements.yml
+yaml
+
+collections:
+  - name: kubernetes.core
+    version: ">=5.0.0"
+  - name: community.general
+    version: ">=8.0.0"
+  - name: ansible.posix
+    version: ">=1.5.0"
+
+📄 inventory/prod/group_vars/all.yml
+yaml
+
+---
+# نسخه‌ها
+kubernetes_version: "1.31.2"
+kubernetes_minor: "1.31"
+containerd_version: "1.7.22"
+cni: "calico"
+calico_version: "v3.28.2"
+
+# شبکه
+pod_subnet: "10.244.0.0/16"
+service_subnet: "10.96.0.0/12"
+cluster_domain: "cluster.local"
+control_plane_endpoint: "k8s-api:6443"
+
+# registry
+image_registry: "registry.local/k8s"
+
+# kubeadm
+kubeadm_extra_sans:
+  - "k8s-api"
+  - "10.0.0.100"
+
+# مسیرها
+kubeconfig_path: "/etc/kubernetes/admin.conf"
+backup_dir: "/backup"
+etcd_backup_retention_days: 7
+
+📄 inventory/prod/group_vars/control_plane.yml
+yaml
+
+---
+is_control_plane: true
+keepalived_enabled: true
+vip: "10.0.0.100"
+keepalived_interface: "eth0"
+keepalived_router_id: 51
+keepalived_priority: "{{ 101 - (groups['control_plane'].index(inventory_hostname)) }}"
+
+📄 inventory/prod/group_vars/workers.yml
+yaml
+
+---
+is_control_plane: false
+node_labels:
+  node-role.kubernetes.io/worker: "worker"
+
+📄 Playbook 1: 01-bootstrap.yml — راه‌اندازی کامل از صفر
+yaml
+
+---
+- name: Bootstrap Kubernetes cluster (HA-ready)
+  hosts: all
+  gather_facts: true
+  become: true
+
+  pre_tasks:
+    - name: Verify OS is Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_major_version | int >= 22
+        fail_msg: "Requires Ubuntu 22.04+"
+      tags: [always, precheck]
+
+    - name: Verify required ports are free
+      ansible.builtin.wait_for:
+        port: "{{ item }}"
+        state: stopped
+        timeout: 3
+      loop: [6443, 10250, 2379, 2380]
+      when: is_control_plane | default(false)
+      ignore_errors: true
+      tags: [precheck]
+
+  roles:
+    - role: common        # swap off, sysctl, modules, NTP, hosts
+      tags: [os, common]
+    - role: containerd    # install containerd + crictl + CNI plugins
+      tags: [runtime]
+    - role: kube-tools    # kubeadm/kubelet/kubectl
+      tags: [k8s-tools]
+    - role: k8s-ha        # keepalived + haproxy (فقط control_plane)
+      when: is_control_plane | default(false) and keepalived_enabled | default(false)
+      tags: [ha]
+
+  post_tasks:
+    - name: Verify kubelet is enabled
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: true
+      register: kubelet_svc
+
+    - name: Display bootstrap status
+      ansible.builtin.debug:
+        msg:
+          - "OS ready: {{ inventory_hostname }}"
+          - "containerd: {{ containerd_version }}"
+          - "kubeadm: {{ kubernetes_version }}"
+
+- name: Initialize first control plane
+  hosts: control_plane[0]
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Check if already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+    - name: Generate kubeadm-config
+      ansible.builtin.template:
+        src: kubeadm-config.yaml.j2
+        dest: /etc/kubernetes/kubeadm-config.yaml
+        mode: "0600"
+
+    - name: Run kubeadm init
+      ansible.builtin.command:
+        cmd: kubeadm init --config=/etc/kubernetes/kubeadm-config.yaml --upload-certs
+      register: kubeadm_init
+      when: not admin_conf.stat.exists
+      failed_when: >
+        kubeadm_init.rc != 0 and
+        "already initialized" not in kubeadm_init.stderr
+
+    - name: Verify kubeadm init succeeded
+      ansible.builtin.assert:
+        that:
+          - "'Your Kubernetes control-plane has initialized successfully' in kubeadm_init.stdout"
+        fail_msg: "kubeadm init failed — check {{ kubeadm_init.stderr }}"
+      when: not admin_conf.stat.exists
+
+    - name: Copy admin.conf to root kube
+      ansible.builtin.shell: |
+        mkdir -p /root/.kube
+        cp -f /etc/kubernetes/admin.conf /root/.kube/config
+        chmod 600 /root/.kube/config
+      changed_when: false
+
+    - name: Get join command for control plane
+      ansible.builtin.shell: |
+        kubeadm token create --print-join-command
+      register: join_cmd_cp
+      changed_when: false
+
+    - name: Get certificate key for CP join
+      ansible.builtin.shell: |
+        kubeadm init phase upload-certs --upload-certs | tail -1
+      register: cert_key
+      changed_when: false
+
+    - name: Save join info
+      ansible.builtin.set_fact:
+        k8s_join_command: "{{ join_cmd_cp.stdout }}"
+        k8s_cert_key: "{{ cert_key.stdout }}"
+
+- name: Join remaining control planes
+  hosts: control_plane[1:]
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Skip if already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Join as control plane
+      ansible.builtin.command:
+        cmd: >
+          {{ hostvars[groups['control_plane'][0]].k8s_join_command }}
+          --control-plane
+          --certificate-key {{ hostvars[groups['control_plane'][0]].k8s_cert_key }}
+          --apiserver-advertise-address={{ ansible_host }}
+          --node-name={{ inventory_hostname }}
+      when: not kubelet_conf.stat.exists
+      register: join_cp
+
+    - name: Wait for control plane to be ready
+      ansible.builtin.command: kubectl get nodes
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      register: cp_ready
+      until: inventory_hostname in cp_ready.stdout
+      retries: 30
+      delay: 5
+      changed_when: false
+
+- name: Install CNI
+  hosts: control_plane[0]
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Install Calico operator
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        src: https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
+      register: calico_op
+      retries: 3
+      delay: 10
+
+    - name: Wait for tigera-operator available
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Deployment
+        namespace: tigera-operator
+        name: tigera-operator
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+
+    - name: Create Calico installation
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: present
+        template: calico-custom.yaml.j2
+
+    - name: Wait for all calico pods
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Pod
+        namespace: calico-system
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 600
+
+- name: Join worker nodes
+  hosts: workers
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Skip if already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Join as worker
+      ansible.builtin.command:
+        cmd: >
+          {{ hostvars[groups['control_plane'][0]].k8s_join_command }}
+          --node-name={{ inventory_hostname }}
+      when: not kubelet_conf.stat.exists
+
+    - name: Label worker nodes
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Node
+        name: "{{ inventory_hostname }}"
+        state: patched
+        definition:
+          metadata:
+            labels: "{{ node_labels }}"
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+- name: Final verification
+  hosts: control_plane[0]
+  gather_facts: false
+  become: true
+  tasks:
+    - name: All nodes Ready
+      ansible.builtin.command:
+        cmd: kubectl get nodes --no-headers
+      register: nodes_out
+      changed_when: false
+      failed_when: >
+        nodes_out.stdout_lines | reject('search', 'Ready') | list | length > 0
+
+    - name: Display cluster status
+      ansible.builtin.debug:
+        msg: "{{ nodes_out.stdout_lines }}"
+
+✅ چک پس از اجرا:
+bash
+
+ansible-playbook playbooks/01-bootstrap.yml -i inventory/prod \
+  --diff --check  # dry-run
+
+ansible-playbook playbooks/01-bootstrap.yml -i inventory/prod 2>&1 | \
+  tee logs/bootstrap-$(date +%Y%m%d).log
+
+grep -E "failed=|unreachable=" logs/bootstrap-*.log | tail -1
+# انتظار: failed=0 unreachable=0
+
+# چک روی master1:
+ssh master1 'kubectl get nodes'
+# انتظار: همه Ready
+
+ssh master1 'kubectl -n calico-system get pods | grep -v Running'
+# انتظار: خالی
+
+📄 Playbook 2: 02-add-node.yml — اضافه کردن نود جدید
+yaml
+
+---
+- name: Prepare and join new worker node
+  hosts: "{{ target_node | default('new_worker') }}"
+  gather_facts: true
+  become: true
+  vars:
+    join_endpoint: "{{ hostvars[groups['control_plane'][0]].ansible_host }}"
+
+  roles:
+    - role: common
+    - role: containerd
+    - role: kube-tools
+
+  tasks:
+    - name: Get fresh join token from control plane
+      ansible.builtin.command: kubeadm token create --print-join-command
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      register: join_cmd
+      changed_when: false
+
+    - name: Join cluster
+      ansible.builtin.command:
+        cmd: "{{ join_cmd.stdout }} --node-name={{ inventory_hostname }}"
+      register: join_out
+      when: not (join_out is defined)
+
+    - name: Wait for node to register on API
+      ansible.builtin.command: kubectl get node {{ inventory_hostname }}
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      register: check
+      until: check.rc == 0
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: Wait for node Ready condition
+      ansible.builtin.command:
+        cmd: >
+          kubectl get node {{ inventory_hostname }}
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      register: ready
+      until: ready.stdout == "True"
+      retries: 60
+      delay: 5
+      changed_when: false
+
+اجرا:
+bash
+
+ansible-playbook playbooks/02-add-node.yml \
+  -i inventory/prod \
+  -e target_node=worker3 \
+  --limit worker3
+
+# ✅ چک:
+ssh master1 'kubectl get nodes worker3 -o wide'
+# انتظار: worker3  Ready  <none>  v1.31.2
+
+📄 Playbook 3: 03-upgrade.yml — ارتقای rolling همه نودها
+yaml
+
+---
+# Phase 1: Pre-upgrade checks
+- name: Pre-upgrade validation
+  hosts: control_plane[0]
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: All nodes Ready
+      ansible.builtin.command: kubectl get nodes --no-headers
+      register: nodes
+      changed_when: false
+      failed_when: nodes.stdout_lines | reject('search', 'Ready') | list | length > 0
+
+    - name: Backup etcd before upgrade
+      ansible.builtin.include_role:
+        name: etcd-backup
+      vars:
+        backup_reason: "pre-upgrade-{{ new_version | default('1.32.0') }}"
+
+    - name: Check API deprecations
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        api_version: apps/v1
+        kind: Deployment
+      register: deploys
+
+    - name: Verify kubeadm target available in local repo
+      ansible.builtin.command:
+        cmd: apt-cache madison kubeadm | grep "{{ new_version }}"
+      register: kubeadm_avail
+      changed_when: false
+      failed_when: kubeadm_avail.stdout == ""
+
+    - name: Log upgrade start
+      ansible.builtin.debug:
+        msg: "Upgrading {{ kubernetes_version }} → {{ new_version }}"
+
+# Phase 2: First control plane — full apply
+- name: Upgrade first control plane (kubeadm upgrade apply)
+  hosts: control_plane[0]
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Upgrade kubeadm package
+      ansible.builtin.apt:
+        name: "kubeadm={{ new_version }}-1.1"
+        state: present
+        allow_change_held_packages: true
+        update_cache: false
+
+    - name: kubeadm upgrade plan
+      ansible.builtin.command: kubeadm upgrade plan
+      register: plan
+      changed_when: false
+
+    - name: Fail if plan has errors
+      ansible.builtin.fail:
+        msg: "Upgrade plan shows issues: {{ plan.stderr }}"
+      when: "'ERROR' in plan.stderr"
+
+    - name: Apply upgrade
+      ansible.builtin.command:
+        cmd: kubeadm upgrade apply {{ new_version }} --yes
+      register: apply
+      failed_when:
+        - apply.rc != 0
+        - "'already at the latest' not in apply.stdout"
+
+    - name: Drain control plane
+      kubernetes.core.k8s_drain:
+        kubeconfig: /etc/kubernetes/admin.conf
+        name: "{{ inventory_hostname }}"
+        drain_timeout: 300s
+        ignore_daemonsets: true
+        delete_emptydir_data: true
+        force: true
+      delegate_to: "{{ inventory_hostname }}"
+      ignore_errors: true
+
+    - name: Upgrade kubelet & kubectl
+      ansible.builtin.apt:
+        name:
+          - "kubelet={{ new_version }}-1.1"
+          - "kubectl={{ new_version }}-1.1"
+        state: present
+        allow_change_held_packages: true
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: true
+
+    - name: Uncordon node
+      kubernetes.core.k8s_drain:
+        kubeconfig: /etc/kubernetes/admin.conf
+        name: "{{ inventory_hostname }}"
+        state: uncordon
+
+    - name: Wait for Ready
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Node
+        name: "{{ inventory_hostname }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+
+# Phase 3: Other control planes — serial
+- name: Upgrade other control planes
+  hosts: control_plane[1:]
+  become: true
+  gather_facts: false
+  serial: 1   # ⚠️ یک به یک — quorum
+
+  tasks:
+    - name: Upgrade kubeadm
+      ansible.builtin.apt:
+        name: "kubeadm={{ new_version }}-1.1"
+        state: present
+        allow_change_held_packages: true
+
+    - name: kubeadm upgrade node
+      ansible.builtin.command: kubeadm upgrade node
+      register: up
+      failed_when: up.rc != 0
+
+    - name: Drain
+      kubernetes.core.k8s_drain:
+        kubeconfig: /etc/kubernetes/admin.conf
+        name: "{{ inventory_hostname }}"
+        drain_timeout: 300s
+        ignore_daemonsets: true
+        delete_emptydir_data: true
+        force: true
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      ignore_errors: true
+
+    - name: Upgrade kubelet/kubectl
+      ansible.builtin.apt:
+        name:
+          - "kubelet={{ new_version }}-1.1"
+          - "kubectl={{ new_version }}-1.1"
+        state: present
+        allow_change_held_packages: true
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: true
+
+    - name: Uncordon
+      kubernetes.core.k8s_drain:
+        kubeconfig: /etc/kubernetes/admin.conf
+        name: "{{ inventory_hostname }}"
+        state: uncordon
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+    - name: Wait Ready
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Node
+        name: "{{ inventory_hostname }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+# Phase 4: Addons
+- name: Upgrade kube-proxy & coredns
+  hosts: control_plane[0]
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Upgrade kube-proxy
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: DaemonSet
+        namespace: kube-system
+        name: kube-proxy
+        state: patched
+        definition:
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: kube-proxy
+                    image: "{{ image_registry }}/kube-proxy:v{{ new_version }}"
+
+    - name: Wait kube-proxy
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: DaemonSet
+        namespace: kube-system
+        name: kube-proxy
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+
+# Phase 5: Workers — canary first
+- name: Upgrade workers
+  hosts: workers
+  become: true
+  gather_facts: false
+  serial: "{{ upgrade_serial | default(1) }}"   # canary=1
+
+  tasks:
+    - name: Upgrade kubeadm
+      ansible.builtin.apt:
+        name: "kubeadm={{ new_version }}-1.1"
+        state: present
+        allow_change_held_packages: true
+
+    - name: kubeadm upgrade node
+      ansible.builtin.command: kubeadm upgrade node
+
+    - name: Drain
+      kubernetes.core.k8s_drain:
+        kubeconfig: /etc/kubernetes/admin.conf
+        name: "{{ inventory_hostname }}"
+        drain_timeout: 300s
+        ignore_daemonsets: true
+        delete_emptydir_data: true
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+    - name: Upgrade kubelet/kubectl
+      ansible.builtin.apt:
+        name:
+          - "kubelet={{ new_version }}-1.1"
+          - "kubectl={{ new_version }}-1.1"
+        state: present
+        allow_change_held_packages: true
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: true
+
+    - name: Uncordon
+      kubernetes.core.k8s_drain:
+        kubeconfig: /etc/kubernetes/admin.conf
+        name: "{{ inventory_hostname }}"
+        state: uncordon
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+    - name: Wait Ready
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Node
+        name: "{{ inventory_hostname }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+# Phase 6: Final verification
+- name: Post-upgrade verification
+  hosts: control_plane[0]
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: All nodes at new version
+      ansible.builtin.command:
+        cmd: kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}'
+      register: versions
+      changed_when: false
+      failed_when: versions.stdout is regex('(?!.*' + new_version + ')') # approximate
+      # دقیق‌تر:
+    - name: Verify no old version remains
+      ansible.builtin.command: kubectl get nodes -o wide
+      register: final
+      changed_when: false
+      failed_when: final.stdout_lines | reject('search', new_version) | reject('search', 'NAME') | list | length > 0
+
+    - name: All pods healthy
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Pod
+        namespace: kube-system
+      register: sys_pods
+
+    - name: Assert sys pods
+      ansible.builtin.assert:
+        that:
+          - sys_pods.resources | selectattr('status.phase', 'ne', 'Running') | selectattr('status.phase', 'ne', 'Succeeded') | list | length == 0
+
+اجرا:
+bash
+
+# Dry-run plan اول:
+ansible-playbook playbooks/03-upgrade.yml -i inventory/prod \
+  -e new_version=1.32.0 --check --diff
+
+# اجرای واقعی در maintenance window:
+ansible-playbook playbooks/03-upgrade.yml -i inventory/prod \
+  -e new_version=1.32.0 \
+  -e upgrade_serial=1 \
+  --forks=1 \
+  2>&1 | tee logs/upgrade-$(date +%Y%m%d).log
+
+# ✅ چک:
+grep -E "failed=|unreachable=" logs/upgrade-*.log | tail -1
+# انتظار: failed=0 unreachable=0
+
+ssh master1 'kubectl get nodes -o wide'
+# انتظار: همه v1.32.0 Ready
+
+📄 Playbook 4: 04-etcd-backup.yml — Backup روزانه
+yaml
+
+---
+- name: Backup etcd on all control planes
+  hosts: control_plane
+  become: true
+  gather_facts: true
+
+  vars:
+    timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    backup_file: "{{ backup_dir }}/etcd-{{ inventory_hostname }}-{{ timestamp }}.db"
+
+  tasks:
+    - name: Ensure backup directory exists
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Save etcd snapshot
+      ansible.builtin.command:
+        cmd: >
+          etcdctl snapshot save {{ backup_file }}
+          --endpoints=https://127.0.0.1:2379
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt
+          --cert=/etc/kubernetes/pki/etcd/server.crt
+          --key=/etc/kubernetes/pki/etcd/server.key
+      environment:
+        ETCDCTL_API: "3"
+      register: snap
+
+    - name: Verify snapshot
+      ansible.builtin.command:
+        cmd: etcdctl snapshot status {{ backup_file }} -w json
+      environment:
+        ETCDCTL_API: "3"
+      register: snap_status
+      changed_when: false
+
+    - name: Parse status
+      ansible.builtin.set_fact:
+        snap_size: "{{ (snap_status.stdout | from_json).totalSize | int }}"
+        snap_keys: "{{ (snap_status.stdout | from_json).totalKey | int }}"
+
+    - name: Fail if snapshot too small
+      ansible.builtin.fail:
+        msg: "Snapshot too small ({{ snap_size }} bytes) — likely corrupt"
+      when: snap_size < 1024
+
+    - name: Copy off-node (to bastion)
+      ansible.builtin.fetch:
+        src: "{{ backup_file }}"
+        dest: "{{ backup_dir }}/remote/{{ inventory_hostname }}/"
+        flat: true
+
+    - name: Prune old backups (> {{ etcd_backup_retention_days }}d)
+      ansible.builtin.find:
+        paths: "{{ backup_dir }}"
+        patterns: "etcd-*.db"
+        age: "{{ etcd_backup_retention_days }}d"
+      register: old
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['control_plane'] }}"
+
+    - name: Remove old snapshots
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old.results | map(attribute='files') | flatten }}"
+
+cron روی master1:
+bash
+
+# /etc/cron.d/ansible-etcd-backup:
+0 2 * * * root cd /opt/k8s-ansible && \
+  ansible-playbook playbooks/04-etcd-backup.yml -i inventory/prod \
+  >> /var/log/ansible-etcd-backup.log 2>&1
+
+📄 Playbook 5: 05-etcd-restore.yml — Disaster Recovery
+yaml
+
+---
+- name: Restore etcd from snapshot
+  hosts: control_plane
+  become: true
+  gather_facts: false
+  vars_prompt:
+    - name: snapshot_file
+      prompt: "Full path to snapshot on master1"
+      private: false
+    - name: confirm_restore
+      prompt: "Type 'RESTORE' to confirm cluster will be rebuilt"
+      private: false
+
+  tasks:
+    - name: Verify confirmation
+      ansible.builtin.fail:
+        msg: "Aborted — type RESTORE"
+      when: confirm_restore != "RESTORE"
+
+    - name: Verify snapshot exists
+      ansible.builtin.stat:
+        path: "{{ snapshot_file }}"
+      register: snap
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+
+    - name: Abort if missing
+      ansible.builtin.fail:
+        msg: "Snapshot not found: {{ snapshot_file }}"
+      when: not snap.stat.exists
+
+    - name: Stop kubelet on all control planes
+      ansible.builtin.systemd:
+        name: kubelet
+        state: stopped
+
+    - name: Stop etcd (via crictl)
+      ansible.builtin.shell: |
+        ETCD_CONTAINER=$(crictl ps --name etcd -q)
+        [ -n "$ETCD_CONTAINER" ] && crictl stop "$ETCD_CONTAINER" || true
+      changed_when: false
+      ignore_errors: true
+
+    - name: Backup current data dir
+      ansible.builtin.command:
+        cmd: mv /var/lib/etcd /var/lib/etcd.broken-{{ ansible_date_time.epoch }}
+      args:
+        creates: /var/lib/etcd.broken-{{ ansible_date_time.epoch }}
+      ignore_errors: true
+
+    - name: Recreate data dir
+      ansible.builtin.file:
+        path: /var/lib/etcd
+        state: directory
+        mode: "0700"
+
+    - name: Fetch snapshot to all control planes
+      ansible.builtin.copy:
+        src: "{{ snapshot_file }}"
+        dest: /tmp/etcd-restore.db
+        mode: "0600"
+      when: inventory_hostname != groups['control_plane'][0]
+      delegate_to: "{{ inventory_hostname }}"
+
+    - name: Build restore args per node
+      ansible.builtin.set_fact:
+        peer_url: "https://{{ ansible_host }}:2380"
+        initial_cluster: >-
+          {%- set items = [] -%}
+          {%- for h in groups['control_plane'] -%}
+            {%- set ip = hostvars[h].ansible_host -%}
+            {%- set _ = items.append(h + '=https://' + ip + ':2380') -%}
+          {%- endfor -%}
+          {{ items | join(',') }}
+
+    - name: Restore etcd
+      ansible.builtin.command:
+        cmd: >
+          etcdctl snapshot restore /tmp/etcd-restore.db
+          --data-dir=/var/lib/etcd
+          --name={{ inventory_hostname }}
+          --initial-cluster={{ initial_cluster }}
+          --initial-advertise-peer-urls={{ peer_url }}
+          --initial-cluster-token=k8s-etcd-restore
+          --initial-cluster-state=new
+      environment:
+        ETCDCTL_API: "3"
+
+    - name: Fix ownership
+      ansible.builtin.file:
+        path: /var/lib/etcd
+        state: directory
+        owner: root
+        group: root
+        recurse: true
+
+    - name: Start kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: started
+
+    - name: Wait for API Server
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 6443
+        timeout: 300
+
+    - name: Verify etcd health
+      ansible.builtin.command:
+        cmd: >
+          etcdctl endpoint health
+          --cluster
+          --endpoints=https://127.0.0.1:2379
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt
+          --cert=/etc/kubernetes/pki/etcd/server.crt
+          --key=/etc/kubernetes/pki/etcd/server.key
+      environment:
+        ETCDCTL_API: "3"
+      register: health
+      until: health.rc == 0
+      retries: 30
+      delay: 10
+
+    - name: Show health
+      ansible.builtin.debug:
+        msg: "{{ health.stdout_lines }}"
+
+- name: Post-restore verification
+  hosts: control_plane[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Nodes registered
+      ansible.builtin.command: kubectl get nodes
+      register: nodes
+      changed_when: false
+
+    - name: Display nodes
+      ansible.builtin.debug:
+        msg: "{{ nodes.stdout_lines }}"
+
+    - name: All system pods healthy
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Pod
+        namespace: kube-system
+      register: pods
+
+    - name: Report unhealthy
+      ansible.builtin.debug:
+        msg: "Unhealthy: {{ pods.resources | selectattr('status.phase', 'ne', 'Running') | map(attribute='metadata.name') | list }}"
+
+    - name: Restart workloads if needed
+      ansible.builtin.command: kubectl rollout restart deployment -n kube-system
+      when: pods.resources | selectattr('status.phase', 'ne', 'Running') | list | length > 0
+
+استفاده:
+bash
+
+ansible-playbook playbooks/05-etcd-restore.yml -i inventory/prod \
+  -e "snapshot_file=/backup/etcd-master1-20241108T020000.db"
+
+# prompt: Type RESTORE to confirm
+
+⚠️ نکته حیاتی: restore به معنی پاک شدن تمام تغییرات بعد از snapshot است. قبل از اجرا، مطمئن شو:
+
+    all nodes را cordon کرده‌ای (بدون workload فعال)
+
+    snapshot سالم است
+
+    kubeadm-config و pki بکاپ دارد
+
+📄 Playbook 6: 06-cert-renew.yml — تمدید گواهی‌ها
+yaml
+
+---
+- name: Renew control plane certificates
+  hosts: control_plane
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Check expiration before
+      ansible.builtin.command: kubeadm certs check-expiration
+      register: before
+      changed_when: false
+
+    - name: Detect expiring soon
+      ansible.builtin.set_fact:
+        expiring: >-
+          {{ before.stdout_lines
+             | select('search', 'RESIDUAL TIME')
+             | reject('search', 'CA')
+             | select('search', '([0-9]|[1-7][0-9])d')
+             | list }}
+
+    - name: Show status
+      ansible.builtin.debug:
+        msg:
+          - "Expiring soon on {{ inventory_hostname }}:"
+          - "{{ expiring | default(['none']) }}"
+
+    - name: Renew all certs
+      ansible.builtin.command: kubeadm certs renew all
+      when: expiring | length > 0
+
+    - name: Verify after
+      ansible.builtin.command: kubeadm certs check-expiration
+      register: after
+      changed_when: false
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: "{{ after.stdout_lines | select('search', 'RESIDUAL|CERTIFICATE') | list }}"
+
+    - name: Restart control plane static pods
+      ansible.builtin.shell: |
+        for c in kube-apiserver kube-controller-manager kube-scheduler; do
+          crictl ps --name "$c" -q | xargs -r crictl stop
+        done
+      when: expiring | length > 0
+      changed_when: true
+
+    - name: Wait for API after restart
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 6443
+        timeout: 180
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+
+# Update kubeconfigs (admin/controller/scheduler)
+- name: Refresh kubeconfig files
+  hosts: control_plane
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Regenerate kubeconfigs
+      ansible.builtin.shell: |
+        kubeadm init phase kubeconfig admin --kubeconfig-dir=/etc/kubernetes
+        kubeadm init phase kubeconfig controller-manager --kubeconfig-dir=/etc/kubernetes
+        kubeadm init phase kubeconfig scheduler --kubeconfig-dir=/etc/kubernetes
+        cp -f /etc/kubernetes/admin.conf /root/.kube/config
+        chmod 600 /root/.kube/config
+      changed_when: true
+
+📄 Playbook 7: 07-node-maintenance.yml — Drain + Maintenance + Uncordon
+yaml
+
+---
+- name: Node maintenance workflow
+  hosts: "{{ target_node }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Cordon and drain node
+      kubernetes.core.k8s_drain:
+        kubeconfig: /etc/kubernetes/admin.conf
+        name: "{{ inventory_hostname }}"
+        drain_timeout: 600s
+        ignore_daemonsets: true
+        delete_emptydir_data: true
+        grace_period: 60
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+    - name: Verify no workloads
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Pod
+        field_selectors:
+          - "spec.nodeName={{ inventory_hostname }}"
+      register: pods
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+    - name: Warn if pods remain
+      ansible.builtin.debug:
+        msg: "Remaining: {{ pods.resources | rejectattr('metadata.namespace', 'match', 'kube-system') | map(attribute='metadata.name') | list }}"
+
+    - name: Wait for user confirmation
+      ansible.builtin.pause:
+        prompt: "Node drained. Press ENTER when maintenance done"
+
+    - name: Uncordon
+      kubernetes.core.k8s_drain:
+        kubeconfig: /etc/kubernetes/admin.conf
+        name: "{{ inventory_hostname }}"
+        state: uncordon
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+    - name: Verify Ready
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Node
+        name: "{{ inventory_hostname }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+📄 Playbook 8: 08-audit-and-harden.yml — CIS Benchmark
+yaml
+
+---
+- name: CIS Kubernetes Benchmark (Level 1)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: k8s-hardening
+      vars:
+        cis_profile: level1
+        cis_fix: "{{ fix_enabled | default(false) }}"
+
+  tasks:
+    - name: Check kubelet anonymous auth
+      ansible.builtin.command:
+        cmd: >
+          kubectl get --raw=/api/v1/nodes/{{ inventory_hostname }}/proxy/configz 2>/dev/null
+      register: configz
+      changed_when: false
+      ignore_errors: true
+
+    - name: Assert anonymous disabled
+      ansible.builtin.assert:
+        that:
+          - "configz.stdout | from_json | json_query('kubeletconfig.authentication.anonymous.enabled') == false"
+        fail_msg: "❌ kubelet anonymous auth ENABLED — vulnerability"
+        success_msg: "✅ kubelet anonymous auth disabled"
+      when: configz.rc == 0
+
+    - name: Check kubelet authorization mode
+      ansible.builtin.assert:
+        that:
+          - "configz.stdout | from_json | json_query('kubeletconfig.authorization.mode') == 'Webhook'"
+        fail_msg: "❌ kubelet authz mode != Webhook"
+        success_msg: "✅ Webhook authorization"
+
+    - name: Check apiserver flags
+      ansible.builtin.command:
+        cmd: grep -E "authorization-mode|admission" /etc/kubernetes/manifests/kube-apiserver.yaml
+      register: api_flags
+      changed_when: false
+      when: is_control_plane | default(false)
+
+    - name: Assert apiserver secure
+      ansible.builtin.assert:
+        that:
+          - "'Node,RBAC' in api_flags.stdout"
+          - "'NodeRestriction' in api_flags.stdout or 'PodSecurity' in api_flags.stdout"
+        fail_msg: "❌ apiserver flags not CIS-compliant"
+        success_msg: "✅ apiserver flags OK"
+      when: is_control_plane | default(false)
+
+    - name: Check /var/lib/kubelet permissions
+      ansible.builtin.stat:
+        path: /var/lib/kubelet
+      register: kubelet_dir
+
+    - name: Assert permissions
+      ansible.builtin.assert:
+        that:
+          - kubelet_dir.stat.mode == '0700' or kubelet_dir.stat.mode == '0750'
+          - kubelet_dir.stat.pw_name == 'root'
+
+    - name: Check etcd data dir
+      ansible.builtin.stat:
+        path: /var/lib/etcd
+      register: etcd_dir
+      when: is_control_plane | default(false)
+
+    - name: Assert etcd perms
+      ansible.builtin.assert:
+        that:
+          - etcd_dir.stat.mode == '0700'
+      when: is_control_plane | default(false)
+
+اجرا:
+bash
+
+# فقط گزارش (fix=false):
+ansible-playbook playbooks/08-audit-and-harden.yml -i inventory/prod
+
+# اعمال رفع:
+ansible-playbook playbooks/08-audit-and-harden.yml -i inventory/prod \
+  -e fix_enabled=true --check --diff  # اول dry-run
+
+🤖 بخش ۵: استفاده از Ansible برای Cross-Cluster Operations
+۵.۱ — Multi-Cluster Inventory
+text
+
+inventory/
+├── prod-us/
+│   ├── hosts.yml
+│   └── group_vars/all.yml  # kubeconfig: /root/.kube/prod-us
+├── prod-eu/
+│   ├── hosts.yml
+│   └── group_vars/all.yml
+└── staging/
+    └── hosts.yml
+
+۵.۲ — Playbook برای sync ConfigMap بین کلاسترها
+yaml
+
+---
+- name: Sync shared ConfigMap across all clusters
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    source_cluster: prod-us
+    target_clusters:
+      - prod-eu
+      - staging
+    config_name: shared-config
+    config_namespace: default
+
+  tasks:
+    - name: Read from source
+      kubernetes.core.k8s_info:
+        kubeconfig: "~/.kube/{{ source_cluster }}"
+        kind: ConfigMap
+        namespace: "{{ config_namespace }}"
+        name: "{{ config_name }}"
+      register: cm
+
+    - name: Write to targets
+      kubernetes.core.k8s:
+        kubeconfig: "~/.kube/{{ item }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ config_name }}"
+            namespace: "{{ config_namespace }}"
+          data: "{{ cm.resources[0].data }}"
+      loop: "{{ target_clusters }}"
+
+    - name: Verify
+      kubernetes.core.k8s_info:
+        kubeconfig: "~/.kube/{{ item }}"
+        kind: ConfigMap
+        namespace: "{{ config_namespace }}"
+        name: "{{ config_name }}"
+      register: verify
+      loop: "{{ target_clusters }}"
+
+    - name: Assert all clusters have config
+      ansible.builtin.assert:
+        that:
+          - verify.results | selectattr('resources', 'eq', []) | list | length == 0
+
+۵.۳ — Playbook برای rolling restart همه deployment ها در همه کلاسترها
+yaml
+
+---
+- name: Rolling restart all deployments in cluster
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    cluster: "{{ target_cluster | default('prod-us') }}"
+    namespace: "{{ target_namespace | default('production') }}"
+
+  tasks:
+    - name: Get all deployments
+      kubernetes.core.k8s_info:
+        kubeconfig: "~/.kube/{{ cluster }}"
+        kind: Deployment
+        namespace: "{{ namespace }}"
+      register: deploys
+
+    - name: Restart each one serially
+      kubernetes.core.k8s:
+        kubeconfig: "~/.kube/{{ cluster }}"
+        state: patched
+        kind: Deployment
+        namespace: "{{ namespace }}"
+        name: "{{ item.metadata.name }}"
+        definition:
+          spec:
+            template:
+              metadata:
+                annotations:
+                  kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
+      loop: "{{ deploys.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Wait all rollouts
+      kubernetes.core.k8s_info:
+        kubeconfig: "~/.kube/{{ cluster }}"
+        kind: Deployment
+        namespace: "{{ namespace }}"
+        name: "{{ item.metadata.name }}"
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 600
+      loop: "{{ deploys.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+🧪 بخش ۶: Testing و Validation
+۶.۱ — Molecule برای role ها
+yaml
+
+# roles/containerd/molecule/default/molecule.yml
+dependency:
+  name: galaxy
+driver:
+  name: docker
+platforms:
+  - name: ubuntu-22
+    image: ubuntu:22.04
+    pre_build_image: false
+    command: /sbin/init
+    privileged: true
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    cgroupns_mode: host
+provisioner:
+  name: ansible
+  inventory:
+    group_vars:
+      all:
+        containerd_version: "1.7.22"
+verifier:
+  name: ansible
+
+bash
+
+cd roles/containerd
+molecule test
+# اجرا: create → converge → idempotence → verify → destroy
+
+۶.۲ — Idempotency Check
+bash
+
+# همه playbook ها باید دو بار پشت هم بدون change اجرا شوند:
+ansible-playbook playbooks/01-bootstrap.yml -i inventory/prod
+ansible-playbook playbooks/01-bootstrap.yml -i inventory/prod | \
+  grep "changed="
+# انتظار: changed=0
+
+۶.۳ — Lint
+bash
+
+pip install ansible-lint yamllint
+
+ansible-lint playbooks/*.yml
+# انتظار: Passed: 0 failure(s), 0 warning(s)
+
+yamllint -c .yamllint playbooks/ roles/
+
+۶.۴ — Syntax Check
+bash
+
+ansible-playbook playbooks/01-bootstrap.yml --syntax-check
+ansible-playbook playbooks/03-upgrade.yml --syntax-check
+
+📊 بخش ۷: Ansible + GitOps — الگوی ترکیبی
+text
+
+┌────────────────────────────────────────────────────────┐
+│ Git Repo                                               │
+│ ├── ansible/         ← bootstrap, upgrade, DR (تغییر کم) │
+│ └── k8s-manifests/   ← app deploys (تغییر زیاد)        │
+└────────────────────────────────────────────────────────┘
+              │                          │
+              ▼                          ▼
+┌───────────────────────┐     ┌────────────────────────┐
+│ CI Pipeline           │     │ ArgoCD                 │
+│ - ansible-lint        │     │ - watch k8s-manifests  │
+│ - molecule test       │     │ - apply to cluster     │
+│ - run 01-bootstrap    │     │ - drift detection      │
+│   (فقط روی cluster    │     │ - rollback via Git     │
+│    creation)          │     └────────────────────────┘
+│ - run 04-backup cron  │
+│ - run 06-cert cron    │
+└───────────────────────┘
+
+۷.۱ — GitLab CI نمونه
+yaml
+
+# .gitlab-ci.yml
+stages: [lint, test, apply, verify]
+
+variables:
+  ANSIBLE_FORCE_COLOR: "1"
+  ANSIBLE_HOST_KEY_CHECKING: "false"
+
+ansible-lint:
+  stage: lint
+  image: quay.io/ansible/creator-ee:v24.6.0
+  script:
+    - ansible-lint playbooks/*.yml
+    - yamllint playbooks/ roles/
+
+molecule-test:
+  stage: test
+  image: quay.io/ansible/creator-ee:v24.6.0
+  services:
+    - docker:dind
+  script:
+    - cd roles/containerd && molecule test
+
+bootstrap-dev:
+  stage: apply
+  image: quay.io/ansible/creator-ee:v24.6.0
+  environment: dev
+  when: manual
+  script:
+    - ansible-playbook playbooks/01-bootstrap.yml -i inventory/dev --diff
+  only:
+    - main
+
+upgrade-prod:
+  stage: apply
+  image: quay.io/ansible/creator-ee:v24.6.0
+  environment: production
+  when: manual
+  script:
+    - ansible-playbook playbooks/03-upgrade.yml -i inventory/prod -e new_version=$TARGET_VERSION
+  only:
+    - tags
+    - /^upgrade-.*$/
+
+verify-after-upgrade:
+  stage: verify
+  image: quay.io/ansible/creator-ee:v24.6.0
+  script:
+    - ansible-playbook playbooks/09-health-check.yml -i inventory/prod
+
+۷.۲ — 09-health-check.yml
+yaml
+
+---
+- name: Cluster health check
+  hosts: control_plane[0]
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: All nodes Ready
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Node
+      register: nodes
+      failed_when: >
+        nodes.resources | selectattr('status.conditions',
+          'match', 'type:Ready') | list | length == 0
+
+    - name: Unhealthy pods
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Pod
+        namespace: kube-system
+      register: sys_pods
+
+    - name: Assert
+      ansible.builtin.assert:
+        that:
+          - sys_pods.resources | selectattr('status.phase', 'ne', 'Running') | selectattr('status.phase', 'ne', 'Succeeded') | list | length == 0
+        fail_msg: "System pods unhealthy"
+
+    - name: etcd health
+      ansible.builtin.command:
+        cmd: >
+          etcdctl endpoint health --cluster
+          --endpoints=https://127.0.0.1:2379
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt
+          --cert=/etc/kubernetes/pki/etcd/server.crt
+          --key=/etc/kubernetes/pki/etcd/server.key
+      environment:
+        ETCDCTL_API: "3"
+      register: etcd
+      failed_when: "'unhealthy' in etcd.stdout"
+
+    - name: readyz
+      ansible.builtin.command:
+        cmd: kubectl get --raw=/readyz
+      register: readyz
+      failed_when: readyz.stdout != "ok"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ nodes: {{ nodes.resources | length }}"
+          - "✅ system pods: {{ sys_pods.resources | length }}"
+          - "✅ etcd: healthy"
+          - "✅ apiserver: readyz ok"
+
+⚠️ بخش ۸: Anti-Patterns (چه کاری نکنیم)
+Anti-Pattern	چرا بد	جایگزین
+Ansible برای deploy app	State ندارد، rollback سخت	ArgoCD/Flux
+Ansible برای هر config تغییر	Git نمی‌بیند	ConfigMap + Git
+k8s module برای scale روزانه	drift می‌سازد	HPA + Git
+Ansible در cluster برای DR	اگر cluster خراب، Ansible هم خراب	Ansible runner خارجی
+shell: kubectl apply	idempotent نیست، خطا نمی‌گیرد	kubernetes.core.k8s
+Secret در Ansible vars	leak در logs	Vault/ESO
+یک playbook چند-هزار-خطی	غیرقابل نگهداری	roles + includes
+--forks=50 روی apiserver	throttle	--forks=10 + serial
+🎯 بخش ۹: چک‌لیست DevOps Engineer
+راه‌اندازی Ansible برای K8s
+text
+
+[ ] ansible-core >= 2.16 نصب
+[ ] kubernetes.core collection نصب
+[ ] ansible.cfg با ssh pipelining
+[ ] inventory با group_vars جدا برای هر environment
+[ ] SSH key به همه نودها
+[ ] runner-ee (Execution Environment) برای CI
+[ ] logs directory برای audit
+
+Playbook های ضروری
+text
+
+[ ] 01-bootstrap.yml       ← راه‌اندازی از صفر
+[ ] 02-add-node.yml        ← scale-out
+[ ] 03-upgrade.yml         ← rolling upgrade
+[ ] 04-etcd-backup.yml     ← cron روزانه
+[ ] 05-etcd-restore.yml    ← DR (تست در staging)
+[ ] 06-cert-renew.yml      ← cron هر ۳ ماه
+[ ] 07-node-maintenance.yml ← drain workflow
+[ ] 08-audit-and-harden.yml ← CIS benchmark
+[ ] 09-health-check.yml    ← verify
+
+Testing
+text
+
+[ ] ansible-lint پاس
+[ ] yamllint پاس
+[ ] --syntax-check برای همه
+[ ] molecule test برای هر role
+[ ] --check --diff روی staging
+[ ] idempotency: دومین اجرا changed=0
+[ ] واقعی در staging قبل از prod
+
+Operations
+text
+
+[ ] all playbooks با --limit برای canary
+[ ] serial: 1 برای master و worker
+[ ] wait_condition برای همه k8s_info
+[ ] health-check بعد از هر operation
+[ ] slack notification در CI
+[ ] backup قبل از upgrade
+
+📎 خلاصه: چه چیزی با Ansible، چه چیزی بدون
+کار	Ansible؟	ابزار بهتر
+Provision VM	❌	Terraform
+نصب OS / kernel	⚠️	Cloud-init
+kubeadm init/join	✅ Ansible	—
+Install/upgrade containerd/kubelet	✅ Ansible	—
+Install CNI	✅ Ansible	یا kubectl apply
+OS hardening (CIS)	✅ Ansible	—
+Certificate renewal	✅ Ansible	—
+etcd backup/restore	✅ Ansible	—
+Node drain/upgrade	✅ Ansible	—
+Deploy app manifests	❌	ArgoCD/Flux
+ConfigMap/Secret management	⚠️	ESO/Vault
+Scale workload	❌	HPA
+Cluster add-ons (cert-manager, ingress)	⚠️	Helm via ArgoCD
+Monitoring stack	⚠️	Helm via ArgoCD
+Backup app data	⚠️	Velero
+
+    🎯 جمع‌بندی: Ansible = زیرساخت و lifecycle کلاستر. GitOps = اپلیکیشن و config. Helm = packaging. Terraform = زیرساخت ابری. kubectl = دیباگ. هر کدام جای خود — هیچ‌کدام جایگزین دیگری نیست.
+
+ 

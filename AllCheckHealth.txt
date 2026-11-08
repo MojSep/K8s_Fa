@@ -1,0 +1,596 @@
+﻿🩺 چک‌لیست جامع سلامت Kubernetes (Master + Worker + Resources)
+
+    برای هر چک: دستور → grep → پیام موفق → پیام خطا → توضیح فنی. همه دستورات با الگوهای واقعی و قابل اجرا در محیط production.
+
+🖥️ بخش ۱: سلامت لایه سیستم‌عامل (همه نودها)
+1.1 — وضعیت Swap (باید غیرفعال باشد)
+bash
+
+swapon --show | grep -v "^$" && echo "❌ SWAP ACTIVE" || echo "✅ NO SWAP"
+free -h | grep -i swap | awk '{if ($2=="0B" || $2=="0") print "✅ SWAP DISABLED"; else print "❌ SWAP ACTIVE: " $2}'
+
+نتیجه	معنی
+✅ NO SWAP	Swap غیرفعال — kubelet درست کار می‌کند
+❌ SWAP ACTIVE	kubelet با failSwapOn: true سرویس را متوقف می‌کند
+
+🔧 دلیل فنی: kubelet به‌طور پیش‌فرض failSwapOn: true دارد و با وجود swap، scheduler نمی‌تواند memory QoS را دقیق تضمین کند. swap باعث می‌شود pod eviction غیرقابل پیش‌بینی شود.
+1.2 — ماژول‌های Kernel
+bash
+
+for mod in overlay br_netfilter nf_conntrack; do
+  lsmod | grep -q "^$mod" && echo "✅ $mod loaded" || echo "❌ $mod NOT LOADED"
+done
+
+انتظار: همه ✅ loaded.
+
+🔧 دلیل فنی: overlay = درایور storage برای containerd/docker؛ br_netfilter = پل بین bridge و iptables (بدون آن net.bridge.bridge-nf-call-iptables بی‌اثر است)؛ nf_conntrack = NAT و session tracking برای kube-proxy.
+1.3 — پارامترهای Sysctl حیاتی
+bash
+
+sysctl net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables | \
+  grep -E "= 1" && echo "✅ SYSCTL OK" || echo "❌ SYSCTL BROKEN"
+
+# بررسی دقیق‌تر
+for p in net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables; do
+  val=$(sysctl -n "$p" 2>/dev/null)
+  [ "$val" = "1" ] && echo "✅ $p = $val" || echo "❌ $p = $val (expected 1)"
+done
+
+پیام موفق: هر سه خط = 1 و ✅ SYSCTL OK.
+
+🔧 دلیل فنی: بدون ip_forward=1، ترافیک بین podها route نمی‌شود. بدون bridge-nf-call-iptables=1، قواعد NAT kube-proxy روی bridge اعمال نمی‌شود → سرویس‌ها کار نمی‌کنند.
+1.4 — منابع دیسک و inode
+bash
+
+df -h / /var/lib/kubelet /var/lib/containerd /var/lib/etcd 2>/dev/null | \
+  awk 'NR>1 {if ($5+0 > 80) print "❌ " $6 " usage: " $5; else print "✅ " $6 " usage: " $5}'
+
+df -i / | awk 'NR>1 {if ($5+0 > 80) print "❌ INODE usage: " $5; else print "✅ INODE usage: " $5}'
+
+پیام موفق: همه usage < 80%.
+
+پیام خطا: ❌ /var/lib/containerd usage: 95% → DiskPressure و eviction podها.
+
+🔧 دلیل فنی: kubelet با nodefs.available < 10% یا imagefs.available < 15% وارد حالت DiskPressure می‌شود و podها را evict می‌کند. حجم زیاد image بدون prune یا لاگ‌های بزرگ container سریع دیسک را پر می‌کنند.
+1.5 — منابع CPU و Memory
+bash
+
+free -h | awk 'NR==2 {avail=$7; total=$2; printf "Memory: %s / %s available ", avail, total; if (avail ~ /G/ && avail+0 > 1) print "✅"; else print "⚠️ LOW"}'
+nproc && echo "✅ CPU cores detected"
+uptime | awk -F'load average:' '{print "Load:"$2}'
+
+🔧 دلیل فنی: اگر available memory < 1Gi و load average > nproc، node در آستانه‌ی MemoryPressure است.
+⚙️ بخش ۲: سلامت Runtime (containerd / CRI)
+2.1 — وضعیت سرویس containerd
+bash
+
+systemctl is-active containerd | grep -q "^active$" && echo "✅ containerd ACTIVE" || echo "❌ containerd DOWN"
+systemctl status containerd --no-pager | grep -E "Active:|Main PID:" 
+
+پیام موفق: ✅ containerd ACTIVE + Active: active (running).
+
+🔧 دلیل فنی: اگر containerd down باشد، kubelet نمی‌تواند هیچ container ای بسازد (نه برای workload و نه برای static podهای control plane). کل کلاستر روی همان نود عملاً مرده است.
+2.2 — پاسخگویی CRI endpoint
+bash
+
+crictl --runtime-endpoint unix:///run/containerd/containerd.sock info 2>&1 | \
+  grep -q "runtimeName" && echo "✅ CRI responding" || echo "❌ CRI not responding"
+
+crictl version 2>&1 | grep -E "Version|RuntimeName"
+
+پیام موفق: Version: 0.1.0 + RuntimeName: containerd.
+
+🔧 دلیل فنی: kubelet از طریق CRI gRPC با containerd صحبت می‌کند. اگر socket پاسخ ندهد، kubelet در حلقه‌ی reconnect گیر می‌کند و node NotReady می‌شود.
+2.3 — تعداد container ها و image های مرده
+bash
+
+crictl ps -a --state exited 2>/dev/null | grep -c "Exited" | \
+  awk '{if ($1 > 20) print "⚠️ " $1 " exited containers"; else print "✅ " $1 " exited containers"}'
+
+crictl images 2>/dev/null | grep -c "<none>" | \
+  awk '{if ($1 > 10) print "⚠️ " $1 " dangling images"; else print "✅ " $1 " dangling images"}'
+
+🔧 دلیل فنی: container های Exited و image های <none> فضای disk را اشغال می‌کنند. اگر --image-gc-high-threshold kubelet فعال باشد، خودکار پاک می‌شوند؛ در غیر این صورت crictl rmi --prune لازم است.
+🧩 بخش ۳: سلامت Kubelet (همه نودها)
+3.1 — وضعیت سرویس kubelet
+bash
+
+systemctl is-active kubelet | grep -q "^active$" && echo "✅ kubelet ACTIVE" || echo "❌ kubelet DOWN"
+journalctl -u kubelet --since "5 min ago" --no-pager | grep -iE "error|failed|panic" | tail -10
+
+پیام موفق: ✅ kubelet ACTIVE و هیچ error|failed|panic در ۵ دقیقه‌ی اخیر.
+
+🔧 دلیل فنی: kubelet مسؤول اجرای podها روی نود و heartbeat به API Server است. اگر down باشد، node بعد از node-monitor-grace-period (پیش‌فرض ۴۰ ثانیه) به NotReady می‌رود.
+3.2 — Health endpoint kubelet
+bash
+
+curl -sk https://localhost:10250/healthz 2>&1 | grep -q "ok" && echo "✅ kubelet healthz OK" || echo "❌ kubelet healthz FAIL"
+
+curl -sk https://localhost:10248/healthz 2>&1 | grep -q "ok" && echo "✅ kubelet 10248 OK" || echo "❌ kubelet 10248 FAIL"
+
+پورت	کاربرد
+10248	healthz ساده (بدون auth)
+10250	API اصلی kubelet (نیاز به cert)
+3.3 — وضعیت Cgroup Driver (تطابق kubelet ↔ containerd)
+bash
+
+kubelet_cg=$(grep -E "^cgroupDriver:" /var/lib/kubelet/config.yaml | awk '{print $2}')
+containerd_cg=$(grep -E "SystemdCgroup" /etc/containerd/config.toml | grep -o "true\|false")
+echo "kubelet: $kubelet_cg | containerd SystemdCgroup: $containerd_cg"
+[ "$kubelet_cg" = "systemd" ] && [ "$containerd_cg" = "true" ] && echo "✅ MATCH" || echo "❌ MISMATCH"
+
+پیام موفق: ✅ MATCH.
+
+🔧 دلیل فنی: mismatch باعث می‌شود limits.memory و limits.cpu اعمال نشوند، podها به‌طور تصادفی OOMKilled شوند و kubelet نتواند cgroup مسیر درست را پیدا کند.
+🎛️ بخش ۴: سلامت Control Plane (فقط Master)
+4.1 — Static Pods Control Plane
+bash
+
+kubectl get pods -n kube-system -l tier=control-plane --no-headers 2>/dev/null | \
+  awk '{print $1, $3}' | while read name status; do
+    [ "$status" = "Running" ] && echo "✅ $name = Running" || echo "❌ $name = $status"
+  done
+
+# چک سریع‌تر:
+kubectl get pods -n kube-system | grep -E "etcd|kube-apiserver|kube-controller-manager|kube-scheduler" | \
+  grep -v "Running" && echo "❌ CONTROL PLANE ISSUE" || echo "✅ CONTROL PLANE HEALTHY"
+
+پیام موفق: چهار پاد Running و چاپ ✅ CONTROL PLANE HEALTHY.
+
+🔧 دلیل فنی: این‌ها static pod هستند (kubelet از /etc/kubernetes/manifests/ می‌خواند). اگر Down شوند، API Server پاسخ نمی‌دهد یا scheduler جدید pod نمی‌چیند.
+4.2 — API Server Health (readyz)
+bash
+
+kubectl get --raw='/readyz?verbose' 2>&1 | grep -E "^\[" | tail -1
+# یا
+kubectl get --raw='/livez' 2>&1 | grep -q "ok" && echo "✅ API Server LIVE" || echo "❌ API Server DEAD"
+
+# بررسی عمیق همه مؤلفه‌ها
+kubectl get --raw='/readyz?verbose' 2>&1 | grep -E "\[-\]|readyz" | head -20
+
+پیام موفق: [+]ping ok ... readyz check passed یا فقط ok.
+
+پیام خطا: [+][-]etcd failed: ... → API Server نمی‌تواند به etcd وصل شود.
+
+🔧 دلیل فنی: /readyz تمام چک‌های حیاتی (etcd connectivity، admission webhook، apiserver internal) را اجرا می‌کند. بهترین دستور برای وضعیت لحظه‌ای API Server.
+4.3 — پاسخگویی API Server (پورت 6443)
+bash
+
+APISERVER=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')
+curl -sk --max-time 5 "${APISERVER}/healthz" 2>&1 | grep -q "ok" && echo "✅ API reachable" || echo "❌ API unreachable"
+
+🔧 دلیل فنی: اگر curl تایم‌اوت بدهد، یا kube-apiserver process مرده، یا فایروال پورت 6443 را بسته.
+4.4 — بررسی Component Statuses (روش قدیمی ولی سریع)
+bash
+
+kubectl get componentstatuses 2>&1 | grep -v "Healthy" | grep -q "scheduler\|controller\|etcd" && \
+  echo "❌ COMPONENT UNHEALTHY" || echo "✅ ALL COMPONENTS HEALTHY"
+
+⚠️ هشدار: componentstatuses در K8s 1.19+ deprecated شده و ممکن است همیشه Healthy نشان دهد حتی اگر واقعاً سالم نباشد. برای production از readyz استفاده کن.
+4.5 — Health و وضعیت etcd
+bash
+
+# از داخل etcd pod:
+kubectl exec -n kube-system etcd-$(hostname) -- \
+  etcdctl --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    endpoint health 2>&1 | grep -E "healthy|unhealthy"
+
+# وضعیت quorum
+kubectl exec -n kube-system etcd-$(hostname) -- \
+  etcdctl --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    endpoint status -w table
+
+پیام موفق: is healthy: successfully committed proposal و در جدول IS LEADER=true برای یک عضو.
+
+🔧 دلیل فنی: etcd نیازمند quorum است (اکثریت اعضای سالم). در HA ۳ عضوی، اگر ۲ عضو down شوند، quorum از بین می‌رود و کل کلاستر read-only یا deadlock می‌شود.
+4.6 — بررسی Latency و حجم دیتابیس etcd
+bash
+
+kubectl exec -n kube-system etcd-$(hostname) -- \
+  etcdctl --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    endpoint status -w json 2>/dev/null | \
+  grep -oE '"dbSize":[0-9]+' | awk -F: '{gb=$2/1024/1024/1024; if (gb > 2) print "⚠️ etcd DB size: " gb "GB"; else print "✅ etcd DB size: " gb "GB"}'
+
+آستانه‌ها:
+حجم	وضعیت
+< 2GB	✅ سالم
+2-4GB	⚠️ نیاز به compaction
+> 4GB	❌ خطرناک — defrag لازم
+
+🔧 دلیل فنی: etcd یک محدودیت نرم ۸ گیگابایتی دارد (شامل overhead). حجم بالا باعث کندی watch، افزایش latency API Server و افزایش احتمال mvcc: database space exceeded می‌شود.
+4.7 — بررسی رهبری Control Plane (HA)
+bash
+
+# شمارش leader ها (باید دقیقاً ۱ برای هر کامپوننت باشد)
+for comp in kube-controller-manager kube-scheduler; do
+  count=$(kubectl get lease -n kube-system "$comp" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)
+  [ -n "$count" ] && echo "✅ $comp leader: $count" || echo "❌ $comp NO LEADER"
+done
+
+🔧 دلیل فنی: در HA، فقط یک instance scheduler/controller-manager فعال است (leader election). اگر هیچ leader ای نباشد، پادهای جدید schedule نمی‌شوند و deployment ها rollout نمی‌کنند.
+4.8 — انقضای گواهی‌ها (Certificate Health)
+bash
+
+kubeadm certs check-expiration 2>/dev/null | grep -E "CERTIFICATE|EXPIRES|RESIDUAL" | head -30
+
+# چک تک‌خطی سریع:
+kubeadm certs check-expiration 2>/dev/null | \
+  grep -E "CA|apiserver|etcd|admin" | awk '{
+    if ($0 ~ /[0-9]{4}/) {
+      cmd="date -d \""$6"\" +%s"; cmd | getline exp; close(cmd);
+      now=systime(); days=int((exp-now)/86400);
+      if (days < 30) print "⚠️ " days " days: " $1;
+      else print "✅ " days " days: " $1
+    }
+  }'
+
+آستانه‌ها:
+باقی‌مانده	اقدام
+> 90 روز	✅ سالم
+30-90 روز	⚠️ برنامه‌ریزی تمدید
+< 30 روز	❌ تمدید فوری: kubeadm certs renew all
+
+🔧 دلیل فنی: گواهی‌های control plane پیش‌فرض ۱ ساله هستند. اگر apiserver.crt منقضی شود، API Server بالا نمی‌آید. اگر kubelet-client-current.pem منقضی شود، node بعد از restart به NotReady می‌رود.
+4.9 — بررسی kubelet.conf و admin.conf
+bash
+
+for f in /etc/kubernetes/admin.conf /etc/kubernetes/kubelet.conf /etc/kubernetes/controller-manager.conf /etc/kubernetes/scheduler.conf; do
+  [ -f "$f" ] && echo "✅ $f exists" || echo "❌ $f MISSING"
+done
+
+# صحت محتوا
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes --no-headers 2>&1 | head -3 | \
+  grep -q "Ready" && echo "✅ admin.conf valid" || echo "❌ admin.conf BROKEN"
+
+🔧 دلیل فنی: اگر admin.conf یا kubelet.conf گم شوند، kubectl یا kubelet نمی‌توانند authenticate کنند و node از کلاستر خارج می‌شود.
+🖥️ بخش ۵: سلامت Worker Nodes
+5.1 — وضعیت همه نودها
+bash
+
+kubectl get nodes --no-headers | awk '{
+  if ($2 == "Ready") print "✅ " $1 " = Ready";
+  else print "❌ " $1 " = " $2
+}'
+
+# چک سریع:
+kubectl get nodes | grep -v " Ready " | grep -v "NAME" && echo "❌ NOT READY NODES" || echo "✅ ALL NODES READY"
+
+پیام موفق: همه ✅ Ready.
+
+🔧 دلیل فنی: NotReady یعنی kubelet از ارسال heartbeat به API Server بازمانده. دلایل: kubelet down، CNI خراب، یا node-monitor-grace-period منقضی.
+5.2 — فشار منابع (Node Pressure)
+bash
+
+kubectl get nodes -o json | jq -r '.items[] | .metadata.name as $n | 
+  .status.conditions[] | select(.type|test("Pressure")) | 
+  "\($n): \(.type)=\(.status)"' | \
+  awk '{
+    if ($0 ~ /True/) print "❌ " $0;
+    else print "✅ " $0
+  }'
+
+پیام موفق: همه False (یعنی MemoryPressure=False, DiskPressure=False, PIDPressure=False).
+
+🔧 دلیل فنی: هر Pressure که True شود، kubelet شروع به evict کردن podها می‌کند بر اساس QoS (BestEffort → Burstable → Guaranteed).
+5.3 — وضعیت node conditions کامل
+bash
+
+kubectl get nodes -o json | jq -r '.items[] | .metadata.name as $n |
+  .status.conditions[] | "\($n): \(.type)=\(.status)"' | \
+  grep -E "NetworkUnavailable=True|Ready=False" && echo "❌ NODE CONDITION BROKEN" || echo "✅ ALL CONDITIONS OK"
+
+شرایط حیاتی:
+Condition	معنی
+Ready	kubelet سالم
+NetworkUnavailable	CNI به‌درستی مقداردهی نشده
+MemoryPressure	خطر OOM
+DiskPressure	خطر eviction
+PIDPressure	exhaustion
+5.4 — بررسی Node Authorizer و RBAC
+bash
+
+kubectl auth can-i get nodes --as="system:node:$(hostname)" 2>&1 | \
+  grep -q "yes" && echo "✅ Node authorizer OK" || echo "❌ Node authorizer BROKEN"
+
+🔧 دلیل فنی: kubelet با identity system:node:<hostname> صحبت می‌کند. Node Authorizer باید به‌طور خودکار این identity را مجاز کند — اگر Authorization mode شامل Node نباشد، kubelet نمی‌تواند با API صحبت کند.
+5.5 — Podهای DaemonSet روی هر نود
+bash
+
+for ds in kube-proxy calico-node cilium kube-flannel-ds; do
+  kubectl get ds -n kube-system "$ds" 2>/dev/null | grep -qE "DESIRED|$ds" && {
+    desired=$(kubectl get ds -n kube-system "$ds" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null)
+    ready=$(kubectl get ds -n kube-system "$ds" -o jsonpath='{.status.numberReady}' 2>/dev/null)
+    [ "$desired" = "$ready" ] && echo "✅ $ds: $ready/$desired" || echo "❌ $ds: $ready/$desired"
+  }
+done
+
+پیام موفق: همه ✅ DS: N/N.
+
+🔧 دلیل فنی: DaemonSet باید روی همه نودهای schedulable یک نسخه داشته باشد. اگر numberReady < desiredNumberScheduled، یک نود CNI/proxy ندارد و شبکه یا سرویس آن نود قطع است.
+📦 بخش ۶: سلامت منابع درون کلاستر
+6.1 — Podهای غیر Running
+bash
+
+kubectl get pods -A --no-headers | awk '{
+  if ($4 != "Running" && $4 != "Completed") print "❌ " $1 "/" $2 " = " $4
+}' | head -20
+
+# خلاصه:
+kubectl get pods -A --no-headers | awk '$4 != "Running" && $4 != "Completed" {c++} END {
+  if (c > 0) print "❌ " c " unhealthy pods"; else print "✅ ALL PODS HEALTHY"
+}'
+
+فیلتر دقیق CrashLoopBackOff:
+bash
+
+kubectl get pods -A | grep -E "CrashLoopBackOff|Error|ImagePullBackOff|ErrImagePull|Pending|Terminating" | \
+  awk '{print "❌ " $1 "/" $2 " = " $4}' | head -20
+
+6.2 — Pod restart بالا
+bash
+
+kubectl get pods -A -o json | jq -r '.items[] | 
+  select(.status.containerStatuses[]?.restartCount > 5) | 
+  "❌ \(.metadata.namespace)/\(.metadata.name): \(.status.containerStatuses[0].restartCount) restarts"' | \
+  head -20 || echo "✅ NO HIGH RESTARTS"
+
+# جایگزین بدون jq:
+kubectl get pods -A --no-headers | awk '$5+0 > 5 {print "❌ " $1 "/" $2 " restarts: " $5}'
+
+آستانه: restartCount > 5 در یک بازه‌ی کوتاه = crash loop یا memory leak.
+6.3 — Deployments ناسالم
+bash
+
+kubectl get deploy -A -o json | jq -r '.items[] | 
+  select(.status.readyReplicas != .spec.replicas) | 
+  "❌ \(.metadata.namespace)/\(.metadata.name): \(.status.readyReplicas // 0)/\(.spec.replicas)"' || \
+  echo "✅ ALL DEPLOYMENTS HEALTHY"
+
+# جایگزین:
+kubectl get deploy -A --no-headers | awk '$3 != $4 {print "❌ " $1 "/" $2 " " $3 "/" $4}'
+
+6.4 — StatefulSet و DaemonSet ناسالم
+bash
+
+# StatefulSet
+kubectl get sts -A -o json | jq -r '.items[] | 
+  select(.status.readyReplicas != .spec.replicas) | 
+  "❌ STS \(.metadata.namespace)/\(.metadata.name)"' || echo "✅ ALL STS HEALTHY"
+
+# DaemonSet
+kubectl get ds -A --no-headers | awk '$3 != $4 {print "❌ DS " $1 "/" $2 " " $3 "/" $4}'
+
+6.5 — Podهای Pending طولانی
+bash
+
+kubectl get pods -A --field-selector=status.phase=Pending -o json | jq -r '
+  .items[] | "❌ \(.metadata.namespace)/\(.metadata.name) Pending since: \(.metadata.creationTimestamp)"' \
+  || echo "✅ NO PENDING PODS"
+
+🔧 دلیل فنی: Pending = پاد به هیچ نودی تخصیص نیافته. دلایل: نبود منابع، nodeSelector/affinity غیرقابل‌تأمین، یا PVC در Pending.
+🌐 بخش ۷: سلامت شبکه
+7.1 — CoreDNS
+bash
+
+dns_ready=$(kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -c "Running")
+dns_total=$(kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null | wc -l)
+[ "$dns_ready" -eq "$dns_total" ] && [ "$dns_total" -gt 0 ] && \
+  echo "✅ CoreDNS: $dns_ready/$dns_total" || echo "❌ CoreDNS: $dns_ready/$dns_total"
+
+# سرویس DNS وجود دارد؟
+kubectl get svc -n kube-system kube-dns --no-headers 2>/dev/null | \
+  grep -q "ClusterIP" && echo "✅ kube-dns service exists" || echo "❌ kube-dns service MISSING"
+
+پیام موفق: ✅ CoreDNS: N/N + ✅ kube-dns service exists.
+
+🔧 دلیل فنی: CoreDNS مسئول تمام service discovery داخل کلاستر است. اگر down شود، اپلیکیشن‌ها نمی‌توانند به هم وصل شوند در حالی که پادها Running هستند.
+7.2 — kube-proxy
+bash
+
+proxy_ds=$(kubectl get ds -n kube-system kube-proxy -o jsonpath='{.status.numberReady}/{.status.desiredNumberScheduled}' 2>/dev/null)
+echo "$proxy_ds" | grep -E "^([0-9]+)/\1$" >/dev/null && \
+  echo "✅ kube-proxy: $proxy_ds" || echo "❌ kube-proxy: $proxy_ds"
+
+# چک iptables روی نود (اگر mode=iptables)
+sudo iptables -t nat -L KUBE-SERVICES -n 2>/dev/null | grep -q "KUBE-SVC" && \
+  echo "✅ iptables rules exist" || echo "❌ NO iptables rules"
+
+🔧 دلیل فنی: kube-proxy قواعد NAT برای ClusterIP را برنامه‌ریزی می‌کند. اگر iptables rules نباشند، سرویس‌ها بدون تأثیر باقی می‌مانند (connection refused یا timeout).
+7.3 — DNS Resolution End-to-End
+bash
+
+kubectl run dns-test-$RANDOM --rm -it --image=busybox:1.36 --restart=Never -- \
+  sh -c 'nslookup kubernetes.default && echo "✅ DNS OK"' 2>&1 | grep -E "✅|can.t resolve"
+
+kubectl run dns-test-$RANDOM --rm -it --image=busybox:1.36 --restart=Never -- \
+  sh -c 'nslookup google.com >/dev/null && echo "✅ EXTERNAL DNS OK" || echo "❌ EXTERNAL DNS FAIL"' 2>&1 | grep -E "✅|❌"
+
+پیام موفق: ✅ DNS OK + ✅ EXTERNAL DNS OK.
+
+تفکیک: اگر داخلی OK و خارجی FAIL → مشکل upstream resolver نود یا egress به پورت 53.
+7.4 — CNI DaemonSet
+bash
+
+for cni in calico-node cilium kube-flannel-ds; do
+  if kubectl get ds -n kube-system "$cni" >/dev/null 2>&1; then
+    ready=$(kubectl get ds -n kube-system "$cni" -o jsonpath='{.status.numberReady}')
+    desired=$(kubectl get ds -n kube-system "$cni" -o jsonpath='{.status.desiredNumberScheduled}')
+    [ "$ready" = "$desired" ] && echo "✅ $cni: $ready/$desired" || echo "❌ $cni: $ready/$desired"
+    break
+  fi
+done
+
+🔧 دلیل فنی: اگر CNI DaemonSet روی یک نود fail شود، پادهای جدید روی آن نود ContainerCreating می‌مانند و شبکه‌ی نود قدیمی هم ممکن است مختل شود.
+7.5 — EndpointSlice سرویس‌های حیاتی
+bash
+
+kubectl get endpointslices -A -o json | jq -r '.items[] | 
+  select((.endpoints // []) | length == 0) | 
+  "❌ \(.metadata.namespace)/\(.metadata.labels[\"kubernetes.io/service-name\"]): EMPTY"' | head -20 \
+  || echo "✅ ALL ENDPOINTS HEALTHY"
+
+هشدار: سرویس‌های ExternalName یا headless بدون backend ممکن است عمداً خالی باشند — با دقت بررسی کن.
+💾 بخش ۸: سلامت ذخیره‌سازی
+8.1 — PVC های غیر Bound
+bash
+
+kubectl get pvc -A --no-headers | awk '$3 != "Bound" {print "❌ " $1 "/" $2 " = " $3}' | head -20
+kubectl get pvc -A --no-headers | awk '$3 != "Bound" {c++} END {
+  if (c > 0) print "❌ " c " UNBOUND PVCs"; else print "✅ ALL PVCs BOUND"
+}'
+
+🔧 نکته: WaitForFirstConsumer ممکن است عمداً Pending باشد تا پاد ساخته شود.
+8.2 — StorageClass ها
+bash
+
+kubectl get storageclass --no-headers | \
+  awk '{print "✅ " $1 " (" $3 ")"}' | head -10
+
+# پیش‌فرض تعریف شده؟
+kubectl get storageclass -o json | jq -r '.items[] | select(.metadata.annotations."storageclass.kubernetes.io/is-default-class"=="true") | .metadata.name' | \
+  grep -q "." && echo "✅ default SC exists" || echo "❌ NO default SC"
+
+8.3 — CSI Drivers
+bash
+
+kubectl get pods -n kube-system --no-headers | grep -i csi | \
+  awk '{if ($3 != "Running") print "❌ " $1 " = " $3; else print "✅ " $1}' | head -10
+
+# اگر CSI pods وجود ندارند:
+kubectl get csidrivers 2>/dev/null | grep -v "NAME" | wc -l | \
+  awk '{if ($1 > 0) print "✅ " $1 " CSIDrivers registered"; else print "⚠️ NO CSIDrivers"}' 
+
+🔧 دلیل فنی: CSI controller مسئول provision/attach/detach است؛ CSI node plugin مسئول mount. اگر هرکدام fail شوند، PVC یا ساخته نمی‌شود یا mount نمی‌شود.
+8.4 — VolumeAttachment های گیرکرده
+bash
+
+kubectl get volumeattachment -o json | jq -r '.items[] | 
+  select(.status.attached == false and .metadata.creationTimestamp != null) | 
+  "⚠️ \(.metadata.name) not attached"' | head -10 || echo "✅ NO STUCK ATTACHMENTS"
+
+🔌 بخش ۹: سلامت API و کانکتیویتی
+9.1 — API Latency
+bash
+
+time (kubectl get nodes >/dev/null 2>&1) 2>&1 | grep real | awk '{
+  split($2, a, "m");
+  if (a[1]+0 > 3000) print "❌ API SLOW: " $2;
+  else print "✅ API latency: " $2
+}'
+
+آستانه: > 3 ثانیه برای get nodes = API Server تحت فشار (etcd کند، overload، یا شبکه).
+9.2 — Admission Webhook ها
+bash
+
+# webhook های معیوب API را بلاک می‌کنند
+kubectl get validatingwebhookconfigurations -o json 2>/dev/null | \
+  jq -r '.items[].webhooks[] | select(.failurePolicy == "Fail") | "⚠️ Fail-policy webhook: \(.name)"' | head -10
+
+# test یک webhook با dry-run
+kubectl create ns test-webhook-$RANDOM --dry-run=server 2>&1 | grep -q "created\|dry run" && \
+  echo "✅ Admission chain works" || echo "❌ WEBHOOK BLOCKING"
+
+🔧 دلیل فنی: اگر webhook با failurePolicy: Fail پاسخ ندهد (مثلاً سرویسش down باشد)، همه‌ی عملیات create/update در کلاستر fail می‌شود. این یکی از رایج‌ترین دلایل «کلاستر کار نمی‌کند ولی podها Running هستند» است.
+🚦 بخش ۱۰: اسکریپت جامع Health Check (یکجا)
+bash
+
+#!/bin/bash
+# k8s-health-check.sh — اجرا از روی master با kubeconfig admin
+echo "═══ Kubernetes Cluster Health Check ═══"
+echo ""
+
+echo "── [1] Nodes ──"
+kubectl get nodes --no-headers | awk '{s=($2=="Ready")?"✅":"❌"; printf "%s %s %s\n",s,$1,$2}'
+
+echo ""
+echo "── [2] Control Plane Pods ──"
+kubectl get pods -n kube-system | grep -E "etcd|apiserver|controller|scheduler" | \
+  awk '{s=($3=="Running")?"✅":"❌"; printf "%s %s %s\n",s,$1,$3}'
+
+echo ""
+echo "── [3] Unhealthy Pods ──"
+kubectl get pods -A --no-headers | awk '$4 != "Running" && $4 != "Completed" {print "❌ "$1"/"$2"="$4}' | head -10
+
+echo ""
+echo "── [4] CoreDNS ──"
+kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers | \
+  awk '{s=($3=="Running")?"✅":"❌"; printf "%s %s %s\n",s,$1,$3}'
+
+echo ""
+echo "── [5] kube-proxy ──"
+kubectl get ds -n kube-system kube-proxy -o jsonpath='{.status.numberReady}/{.status.desiredNumberScheduled}' 2>/dev/null | \
+  awk -F/ '{s=($1==$2)?"✅":"❌"; printf "%s kube-proxy %s/%s\n",s,$1,$2}'
+
+echo ""
+echo "── [6] Deployments ──"
+kubectl get deploy -A --no-headers | awk '$3 != $4 {print "❌ "$1"/"$2" "$3"/"$4}' | head -5
+
+echo ""
+echo "── [7] PVCs ──"
+kubectl get pvc -A --no-headers | awk '$3 != "Bound" {print "❌ "$1"/"$2"="$3}' | head -5
+
+echo ""
+echo "── [8] Certificates ──"
+kubeadm certs check-expiration 2>/dev/null | grep -E "CA|apiserver|etcd-server|admin.conf" | head -5
+
+echo ""
+echo "── [9] API Latency ──"
+time (kubectl get nodes >/dev/null 2>&1) 2>&1 | grep real
+
+echo ""
+echo "── [10] etcd Health ──"
+kubectl exec -n kube-system etcd-$(hostname) -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  --endpoints=https://127.0.0.1:2379 endpoint health 2>&1 | grep -E "healthy|unhealthy"
+
+echo ""
+echo "── [11] readyz ──"
+kubectl get --raw='/readyz' 2>&1
+
+echo ""
+echo "── [12] High Restart Pods ──"
+kubectl get pods -A --no-headers | awk '$5+0 > 5 {print "⚠️ "$1"/"$2" restarts="$5}' | head -5
+
+echo ""
+echo "═══ END ═══"
+
+📊 جدول مرجع سریع — آستانه‌ها و پیام‌های کلیدی
+چک	دستور کلیدی	پیام موفق	پیام خطا
+Nodes	kubectl get nodes	Ready	NotReady
+API health	kubectl get --raw=/readyz	ok	[-]etcd failed
+Control Plane	kubectl get pods -n kube-system	Running	CrashLoopBackOff
+etcd	etcdctl endpoint health	is healthy	context deadline
+CoreDNS	kubectl get pods -n kube-system -l k8s-app=kube-dns	Running	CrashLoop
+kube-proxy	kubectl get ds -n kube-system kube-proxy	N/N	M/N (M<N)
+Cert	kubeadm certs check-expiration	> 30d	RESIDUAL TIME: < 0
+PVC	kubectl get pvc -A	Bound	Pending
+Pod restart	kubectl get pods -A	< 5	> 5 در بازه کوتاه
+API latency	time kubectl get nodes	< 3s	> 3s
+Disk	df -h /var/lib/containerd	< 80%	> 85%
+Sysctl	sysctl net.ipv4.ip_forward	= 1	= 0
+Swap	swapon --show	خالی	خروجی دارد
+🎯 ترتیب توصیه‌شده برای اجرا
+text
+
+1. OS layer       → sysctl, swap, disk, kernel modules
+2. Runtime        → containerd/docker, CRI
+3. kubelet        → systemctl status, healthz
+4. Control Plane  → static pods, readyz, etcd, certificates
+5. Nodes          → Ready, Pressure, DaemonSets
+6. Networking     → CoreDNS, kube-proxy, CNI, DNS test
+7. Workloads      → pods, deployments, restarts
+8. Storage        → PVCs, CSI, VolumeAttachment
+9. API            → latency, webhooks
+
+

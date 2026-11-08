@@ -1,0 +1,1106 @@
+﻿🚨 سیستم مانیتورینگ و هشدار خودکار Kubernetes
+
+    دو مسیر عملیاتی: (الف) Production-grade با Prometheus+Alertmanager و (ب) Simple با Cron + Notification. هر دو کامل و قابل استفاده فوری.
+
+📐 معماری
+text
+
+┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│ k8s_health_      │    │ Prometheus       │    │ Alertmanager     │
+│ exporter.py      │───▶│ (scrape 60s)     │───▶│ (route+notify)   │
+│ (:9876/metrics)  │    │ (rules every 15s)│    │                  │
+└────────┬─────────┘    └──────────────────┘    └────────┬─────────┘
+         │                                                │
+         │ kubectl / kubeadm / crictl                    │
+         ▼                                                ▼
+   ┌──────────────┐                            ┌──────────────────┐
+   │ Kubernetes   │                            │ Slack/Telegram   │
+   │ Master+Nodes │                            │ Email/PagerDuty  │
+   └──────────────┘                            └──────────────────┘
+
+🗂️ ساختار فایل‌ها
+text
+
+/opt/k8s-monitor/
+├── k8s-health-check.sh                 # چک سریع bash (مسیر ساده/cron)
+├── k8s_health_exporter.py              # Prometheus exporter (مسیر production)
+├── requirements.txt                    # وابستگی‌های Python
+├── k8s-health-exporter.service         # systemd unit
+├── prometheus-scrape.yml               # تکه‌ای برای prometheus.yml
+├── alerting-rules.yml                  # PrometheusRule
+├── alertmanager.yml                    # کانفیگ Alertmanager
+├── notify.sh                           # اسکریپت نوتیفیکیشن (برای cron path)
+└── install.sh                          # نصب همه
+
+📄 ۱. k8s-health-check.sh — چک سریع (برای Cron / اجرای دستی)
+bash
+
+#!/usr/bin/env bash
+# k8s-health-check.sh — خواندن سلامت کلاستر، خروجی JSON + exit code
+# exit 0 = سالم | exit 1 = هشدار | exit 2 = بحرانی
+
+set -uo pipefail
+KUBECTL="${KUBECTL:-kubectl}"
+OUTPUT_JSON="${OUTPUT_JSON:-/var/log/k8s-health/health.json}"
+mkdir -p "$(dirname "$OUTPUT_JSON")"
+
+status="healthy"
+warnings=()
+criticals=()
+add_ok()   { :; }
+add_warn() { warnings+=("$1");  [[ "$status" == "healthy" ]] && status="warning"; }
+add_crit() { criticals+=("$1"); status="critical"; }
+
+# ── ۱. نودها ──
+while IFS= read -r line; do
+  node=$(awk '{print $1}' <<<"$line"); state=$(awk '{print $2}' <<<"$line")
+  [[ "$state" == "Ready" ]] || add_crit "node/$node=$state"
+done < <("$KUBECTL" get nodes --no-headers 2>/dev/null)
+
+# ── ۲. Control Plane Pods ──
+for comp in kube-apiserver etcd kube-controller-manager kube-scheduler; do
+  ready=$("$KUBECTL" get pods -n kube-system -l "component=$comp" \
+    --no-headers 2>/dev/null | grep -c "Running")
+  [[ "$ready" -ge 1 ]] || add_crit "control-plane/$comp=DOWN"
+done
+
+# ── ۳. readyz ──
+"$KUBECTL" get --raw='/readyz' 2>/dev/null | grep -q "^ok$" \
+  || add_crit "apiserver/readyz=FAIL"
+
+# ── ۴. CoreDNS ──
+dns_total=$("$KUBECTL" get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null | wc -l)
+dns_ready=$("$KUBECTL" get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -c "Running")
+[[ "$dns_total" -gt 0 && "$dns_ready" -eq "$dns_total" ]] \
+  || add_crit "coredns=${dns_ready}/${dns_total}"
+
+# ── ۵. kube-proxy ──
+kp_ready=$("$KUBECTL" get ds -n kube-system kube-proxy -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+kp_des=$("$KUBECTL" get ds -n kube-system kube-proxy -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+[[ "$kp_ready" == "$kp_des" && "$kp_des" -gt 0 ]] || add_warn "kube-proxy=${kp_ready}/${kp_des}"
+
+# ── ۶. Podهای ناسالم ──
+while IFS= read -r line; do
+  ns=$(awk '{print $1}' <<<"$line"); pod=$(awk '{print $2}' <<<"$line"); phase=$(awk '{print $4}' <<<"$line")
+  case "$phase" in
+    Running|Completed|Succeeded) :;;
+    CrashLoopBackOff|ImagePullBackOff|ErrImagePull|Error) add_crit "pod/$ns/$pod=$phase";;
+    Pending|Terminating)                                  add_warn "pod/$ns/$pod=$phase";;
+    *)                                                    add_warn "pod/$ns/$pod=$phase";;
+  esac
+done < <("$KUBECTL" get pods -A --no-headers 2>/dev/null)
+
+# ── ۷. Deploymentهای ناسالم ──
+while IFS= read -r line; do
+  ns=$(awk '{print $1}' <<<"$line"); name=$(awk '{print $2}' <<<"$line")
+  ready=$(awk '{print $3}' <<<"$line"); desired=$(awk '{print $4}' <<<"$line")
+  [[ "$ready" == "$desired" ]] || add_warn "deploy/$ns/$name=${ready}/${desired}"
+done < <("$KUBECTL" get deploy -A --no-headers 2>/dev/null | awk '$3!=$4')
+
+# ── ۸. PVCهای Bound نشده ──
+while IFS= read -r line; do
+  ns=$(awk '{print $1}' <<<"$line"); name=$(awk '{print $2}' <<<"$line"); st=$(awk '{print $3}' <<<"$line")
+  add_warn "pvc/$ns/$name=$st"
+done < <("$KUBECTL" get pvc -A --no-headers 2>/dev/null | awk '$3!="Bound"')
+
+# ── ۹. Certificates ──
+if command -v kubeadm >/dev/null 2>&1; then
+  while IFS= read -r line; do
+    days=$(grep -oE '(-?[0-9]+)d' <<<"$line" | head -1 | tr -d 'd')
+    name=$(awk '{print $1}' <<<"$line")
+    if [[ -n "${days:-}" ]]; then
+      if   [[ "$days" -lt 0 ]];  then add_crit "cert/$name=EXPIRED"
+      elif [[ "$days" -lt 7 ]];  then add_crit "cert/$name=${days}d"
+      elif [[ "$days" -lt 30 ]]; then add_warn "cert/$name=${days}d"
+      fi
+    fi
+  done < <(kubeadm certs check-expiration 2>/dev/null | grep -E '^[a-z]' || true)
+fi
+
+# ── ۱۰. سرویس‌های محلی ──
+systemctl is-active kubelet     >/dev/null 2>&1 || add_crit "kubelet=DOWN"
+systemctl is-active containerd  >/dev/null 2>&1 || add_warn "containerd=DOWN"
+
+# ── ۱۱. دیسک ──
+for path in / /var/lib/containerd /var/lib/etcd; do
+  [[ -d "$path" ]] || continue
+  usage=$(df "$path" 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%')
+  [[ "${usage:-0}" -gt 85 ]] && add_crit "disk/$path=${usage}%"
+  [[ "${usage:-0}" -gt 75 && "${usage:-0}" -le 85 ]] && add_warn "disk/$path=${usage}%"
+done
+
+# ── ۱۲. API latency ──
+t0=$(date +%s%N)
+"$KUBECTL" get nodes >/dev/null 2>&1
+t1=$(date +%s%N)
+api_ms=$(( (t1 - t0) / 1000000 ))
+[[ "$api_ms" -gt 3000 ]] && add_crit "apiserver/latency=${api_ms}ms"
+[[ "$api_ms" -gt 1500 && "$api_ms" -le 3000 ]] && add_warn "apiserver/latency=${api_ms}ms"
+
+# ── خروجی JSON ──
+now=$(date -u +%FT%TZ)
+{
+  printf '{"timestamp":"%s","status":"%s","api_latency_ms":%d,"warnings":[' "$now" "$status" "$api_ms"
+  for i in "${!warnings[@]}";  do [[ $i -gt 0 ]] && printf ','; printf '"%s"' "${warnings[$i]}";  done
+  printf '],"criticals":['
+  for i in "${!criticals[@]}"; do [[ $i -gt 0 ]] && printf ','; printf '"%s"' "${criticals[$i]}"; done
+  printf ']}\n'
+} > "$OUTPUT_JSON"
+
+cat "$OUTPUT_JSON"
+case "$status" in
+  healthy)  exit 0;;
+  warning)  exit 1;;
+  critical) exit 2;;
+esac
+
+📄 ۲. k8s_health_exporter.py — قلب سیستم (Prometheus Exporter)
+python
+
+#!/usr/bin/env python3
+"""
+Kubernetes Health Exporter
+Metrics on http://0.0.0.0:9876/metrics
+
+Env vars:
+  KUBECONFIG      default /etc/kubernetes/admin.conf
+  KUBECTL         default /usr/local/bin/kubectl
+  CHECK_INTERVAL  default 60 (seconds)
+  METRIC_PORT     default 9876
+  DISK_PATHS      default /,/var/lib/kubelet,/var/lib/containerd,/var/lib/etcd
+  LOG_LEVEL       default INFO
+"""
+import os, sys, json, time, logging, subprocess, threading
+from datetime import datetime, timezone
+from prometheus_client import Gauge, Counter, start_http_server
+
+# ─── Config ────────────────────────────────────────
+KUBECTL            = os.environ.get("KUBECTL", "/usr/local/bin/kubectl")
+KUBECONFIG         = os.environ.get("KUBECONFIG", "/etc/kubernetes/admin.conf")
+INTERVAL           = int(os.environ.get("CHECK_INTERVAL", "60"))
+PORT               = int(os.environ.get("METRIC_PORT", "9876"))
+DISK_PATHS         = os.environ.get("DISK_PATHS", "/,/var/lib/kubelet,/var/lib/containerd,/var/lib/etcd").split(",")
+LOG_LEVEL          = os.environ.get("LOG_LEVEL", "INFO")
+
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("k8s-health")
+
+# ─── Metrics ───────────────────────────────────────
+GAUGES = {
+  "exporter_up":         Gauge("k8s_health_exporter_up", "1 if last cycle succeeded"),
+  "last_success":        Gauge("k8s_health_last_success_timestamp_seconds", "Unix ts"),
+  "cycle_duration":      Gauge("k8s_health_cycle_duration_seconds", "Duration of last cycle"),
+  "node_ready":          Gauge("k8s_health_node_ready", "1 if Ready", ["node"]),
+  "node_pressure":       Gauge("k8s_health_node_pressure", "1 if pressure", ["node","type"]),
+  "cp_pod_up":           Gauge("k8s_health_control_plane_pod_up", "1 if running", ["component"]),
+  "readyz":              Gauge("k8s_health_readyz", "1 if /readyz ok"),
+  "etcd_healthy":        Gauge("k8s_health_etcd_healthy", "1 if healthy"),
+  "etcd_dbsize":         Gauge("k8s_health_etcd_dbsize_bytes", "etcd DB size"),
+  "etcd_has_leader":     Gauge("k8s_health_etcd_has_leader", "1 if leader"),
+  "cert_days":           Gauge("k8s_health_cert_expires_days", "Days until expiry", ["name"]),
+  "coredns_ratio":       Gauge("k8s_health_coredns_ready_ratio", "CoreDNS ratio"),
+  "kubeproxy_ratio":     Gauge("k8s_health_kubeproxy_ready_ratio", "kube-proxy ratio"),
+  "cni_ratio":           Gauge("k8s_health_cni_ready_ratio", "CNI ratio", ["name"]),
+  "deploy_ratio":        Gauge("k8s_health_deployment_ready_ratio", "Deploy ratio", ["namespace","name"]),
+  "sts_ratio":           Gauge("k8s_health_sts_ready_ratio", "STS ratio", ["namespace","name"]),
+  "pod_unhealthy":       Gauge("k8s_health_pod_unhealthy", "1 if unhealthy", ["namespace","pod","phase"]),
+  "pod_restarts":        Gauge("k8s_health_pod_restarts", "Restart count", ["namespace","pod","container"]),
+  "pvc_unbound":         Gauge("k8s_health_pvc_unbound_count", "Unbound PVCs"),
+  "va_stuck":            Gauge("k8s_health_volumeattachment_stuck_count", "Stuck VolumeAttachments"),
+  "webhook_failpolicy":  Gauge("k8s_health_webhook_failpolicy_count", "Fail-policy webhooks"),
+  "api_latency":         Gauge("k8s_health_api_latency_seconds", "kubectl get nodes latency"),
+  "disk_usage":          Gauge("k8s_health_disk_usage_ratio", "Disk usage", ["path"]),
+  "swap_active":         Gauge("k8s_health_swap_active", "1 if swap active"),
+  "sysctl_ok":           Gauge("k8s_health_sysctl_ok", "1 if sysctl ok"),
+  "kernel_ok":           Gauge("k8s_health_kernel_modules_ok", "1 if modules loaded"),
+  "kubelet_active":      Gauge("k8s_health_kubelet_active", "1 if active"),
+  "containerd_active":   Gauge("k8s_health_containerd_active", "1 if active"),
+}
+ERRORS = Counter("k8s_health_check_errors_total", "Internal errors", ["check"])
+
+# ─── Helpers: kubectl ──────────────────────────────
+def kc(*args, timeout=15, json_out=True):
+    cmd = [KUBECTL, "--kubeconfig", KUBECONFIG, *args]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"timeout: {' '.join(args)}")
+    except FileNotFoundError:
+        raise RuntimeError(f"kubectl not found: {KUBECTL}")
+    if r.returncode != 0:
+        raise RuntimeError(f"kubectl {args[0]} rc={r.returncode}: {r.stderr.strip()[:200]}")
+    return json.loads(r.stdout) if json_out else r.stdout
+
+# ─── Stale label cleanup ───────────────────────────
+_TRACKED = {}
+def replace_all(gauge, entries):
+    """Replace all series of a labeled gauge. entries=[(labels_dict, value)]."""
+    name = gauge._name
+    names = gauge._labelnames
+    new_keys = set()
+    for labels, value in entries:
+        key = tuple(str(labels[n]) for n in names)
+        new_keys.add(key)
+        gauge.labels(**labels).set(value)
+    for old_key in _TRACKED.get(name, set()) - new_keys:
+        try: gauge.remove(*old_key)
+        except Exception: pass
+    _TRACKED[name] = new_keys
+
+# ─── Individual checks ─────────────────────────────
+def check_nodes():
+    nodes = kc("get", "nodes", "-o", "json")["items"]
+    entries_ready, entries_pressure = [], []
+    for n in nodes:
+        name = n["metadata"]["name"]
+        for cond in n["status"]["conditions"]:
+            t = cond["type"]
+            if t == "Ready":
+                entries_ready.append(({"node": name}, 1 if cond["status"] == "True" else 0))
+            elif t in ("MemoryPressure", "DiskPressure", "PIDPressure", "NetworkUnavailable"):
+                entries_pressure.append(
+                    ({"node": name, "type": t}, 1 if cond["status"] == "True" else 0))
+    replace_all(GAUGES["node_ready"], entries_ready)
+    replace_all(GAUGES["node_pressure"], entries_pressure)
+
+def check_control_plane():
+    pods = kc("get", "pods", "-n", "kube-system", "-o", "json")["items"]
+    comps = ["kube-apiserver", "etcd", "kube-controller-manager", "kube-scheduler"]
+    entries = []
+    for c in comps:
+        up = 0
+        for p in pods:
+            if p["metadata"].get("labels", {}).get("component") == c:
+                if p["status"].get("phase") == "Running":
+                    up = 1
+        entries.append(({"component": c}, up))
+    replace_all(GAUGES["cp_pod_up"], entries)
+
+def check_readyz():
+    try:
+        out = kc("get", "--raw=/readyz", json_out=False)
+        GAUGES["readyz"].set(1 if out.strip() == "ok" else 0)
+    except Exception:
+        GAUGES["readyz"].set(0)
+
+def check_etcd():
+    try:
+        pods = kc("get", "pods", "-n", "kube-system", "-l", "component=etcd", "-o", "json")["items"]
+        if not pods:
+            return
+        pod = pods[0]["metadata"]["name"]
+        base = ["exec", "-n", "kube-system", pod, "--", "etcdctl",
+                "--cacert=/etc/kubernetes/pki/etcd/ca.crt",
+                "--cert=/etc/kubernetes/pki/etcd/server.crt",
+                "--key=/etc/kubernetes/pki/etcd/server.key",
+                "--endpoints=https://127.0.0.1:2379"]
+        # health
+        try:
+            out = kc(*base, "endpoint", "health", json_out=False)
+            GAUGES["etcd_healthy"].set(1 if "is healthy" in out else 0)
+        except Exception:
+            GAUGES["etcd_healthy"].set(0)
+        # db size + leader
+        try:
+            raw = kc(*base, "endpoint", "status", "-w", "json", json_out=False)
+            data = json.loads(raw)
+            entry = data[0] if isinstance(data, list) else data
+            GAUGES["etcd_dbsize"].set(entry.get("Status", {}).get("dbSize", 0))
+            leader = entry.get("Status", {}).get("leader", 0)
+            GAUGES["etcd_has_leader"].set(1 if leader else 0)
+        except Exception:
+            GAUGES["etcd_dbsize"].set(0)
+            GAUGES["etcd_has_leader"].set(0)
+    except Exception as e:
+        ERRORS.labels(check="etcd").inc()
+        log.warning("etcd check failed: %s", e)
+
+def check_certs():
+    try:
+        out = subprocess.run(["kubeadm", "certs", "check-expiration"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return
+    import re
+    entries = []
+    for line in out.splitlines():
+        m = re.match(r"^(\S+)\s+\w{3}\s+\d+,\s+\d+\s+\d+:\d+\s+\w+\s+(-?\d+)d", line)
+        if m:
+            entries.append(({"name": m.group(1)}, int(m.group(2))))
+    if entries:
+        replace_all(GAUGES["cert_days"], entries)
+
+def check_coredns():
+    try:
+        pods = kc("get", "pods", "-n", "kube-system", "-l", "k8s-app=kube-dns", "-o", "json")["items"]
+        total = len(pods)
+        ready = sum(1 for p in pods if p["status"].get("phase") == "Running")
+        GAUGES["coredns_ratio"].set(ready / total if total else 0)
+    except Exception:
+        GAUGES["coredns_ratio"].set(0)
+
+def check_kubeproxy():
+    try:
+        ds = kc("get", "ds", "-n", "kube-system", "kube-proxy", "-o", "json")
+        ready = ds.get("status", {}).get("numberReady", 0)
+        desired = ds.get("status", {}).get("desiredNumberScheduled", 0)
+        GAUGES["kubeproxy_ratio"].set(ready / desired if desired else 0)
+    except Exception:
+        GAUGES["kubeproxy_ratio"].set(0)
+
+def check_cni():
+    try:
+        ds_list = kc("get", "ds", "-n", "kube-system", "-o", "json")["items"]
+        entries = []
+        for ds in ds_list:
+            name = ds["metadata"]["name"]
+            if not any(k in name for k in ("calico", "cilium", "flannel", "weave", "antrea")):
+                continue
+            ready = ds.get("status", {}).get("numberReady", 0)
+            desired = ds.get("status", {}).get("desiredNumberScheduled", 0)
+            entries.append(({"name": name}, ready / desired if desired else 0))
+        if entries:
+            replace_all(GAUGES["cni_ratio"], entries)
+    except Exception:
+        pass
+
+def check_workloads():
+    try:
+        # Deployments
+        deploys = kc("get", "deploy", "-A", "-o", "json")["items"]
+        entries = []
+        for d in deploys:
+            spec = d.get("spec", {}).get("replicas", 0) or 0
+            ready = d.get("status", {}).get("readyReplicas", 0) or 0
+            entries.append(({"namespace": d["metadata"]["namespace"],
+                             "name": d["metadata"]["name"]},
+                            ready / spec if spec else 1.0))
+        replace_all(GAUGES["deploy_ratio"], entries)
+        # StatefulSets
+        stss = kc("get", "sts", "-A", "-o", "json")["items"]
+        entries = []
+        for s in stss:
+            spec = s.get("spec", {}).get("replicas", 0) or 0
+            ready = s.get("status", {}).get("readyReplicas", 0) or 0
+            entries.append(({"namespace": s["metadata"]["namespace"],
+                             "name": s["metadata"]["name"]},
+                            ready / spec if spec else 1.0))
+        replace_all(GAUGES["sts_ratio"], entries)
+        # Pods
+        pods = kc("get", "pods", "-A", "-o", "json")["items"]
+        un_entries, restart_entries = [], []
+        for p in pods:
+            phase = p["status"].get("phase", "Unknown")
+            ns = p["metadata"]["namespace"]
+            name = p["metadata"]["name"]
+            healthy = False
+            if phase in ("Running", "Succeeded"):
+                cstats = p["status"].get("containerStatuses", [])
+                if cstats and all(c.get("ready") for c in cstats):
+                    healthy = True
+                # bare pods without containerStatuses: assume healthy if Running
+                if not cstats and phase == "Running":
+                    healthy = True
+            if not healthy:
+                un_entries.append(({"namespace": ns, "pod": name, "phase": phase}, 1))
+            for c in p["status"].get("containerStatuses", []):
+                cnt = c.get("restartCount", 0)
+                if cnt > 0:
+                    restart_entries.append(({"namespace": ns, "pod": name,
+                                             "container": c.get("name", "?")}, cnt))
+        replace_all(GAUGES["pod_unhealthy"], un_entries)
+        replace_all(GAUGES["pod_restarts"], restart_entries)
+    except Exception as e:
+        ERRORS.labels(check="workloads").inc()
+        log.warning("workloads check: %s", e)
+
+def check_storage():
+    try:
+        pvcs = kc("get", "pvc", "-A", "-o", "json")["items"]
+        unbound = sum(1 for p in pvcs if p.get("status", {}).get("phase") != "Bound")
+        GAUGES["pvc_unbound"].set(unbound)
+    except Exception:
+        ERRORS.labels(check="pvc").inc()
+    try:
+        vas = kc("get", "volumeattachment", "-o", "json")["items"]
+        stuck = sum(1 for v in vas if not v.get("status", {}).get("attached", False))
+        GAUGES["va_stuck"].set(stuck)
+    except Exception:
+        ERRORS.labels(check="volumeattachment").inc()
+
+def check_webhooks():
+    try:
+        whs = kc("get", "validatingwebhookconfigurations", "-o", "json").get("items", [])
+        total = 0
+        for wh in whs:
+            for w in wh.get("webhooks", []):
+                if w.get("failurePolicy") == "Fail":
+                    total += 1
+        # also mutating
+        whs2 = kc("get", "mutatingwebhookconfigurations", "-o", "json").get("items", [])
+        for wh in whs2:
+            for w in wh.get("webhooks", []):
+                if w.get("failurePolicy") == "Fail":
+                    total += 1
+        GAUGES["webhook_failpolicy"].set(total)
+    except Exception:
+        pass
+
+def check_api_latency():
+    t0 = time.monotonic()
+    try:
+        kc("get", "nodes", "-o", "json", timeout=10)
+        GAUGES["api_latency"].set(time.monotonic() - t0)
+    except Exception:
+        GAUGES["api_latency"].set(99.0)  # mark as broken
+
+def check_host():
+    # disk
+    entries = []
+    for path in DISK_PATHS:
+        try:
+            st = os.statvfs(path)
+            used = 1 - (st.f_bavail / st.f_blocks)
+            entries.append(({"path": path}, used))
+        except Exception:
+            pass
+    if entries:
+        replace_all(GAUGES["disk_usage"], entries)
+    # swap
+    try:
+        with open("/proc/swaps") as f:
+            lines = [l for l in f.read().splitlines()[1:] if l.strip()]
+        GAUGES["swap_active"].set(1 if lines else 0)
+    except Exception:
+        GAUGES["swap_active"].set(0)
+    # sysctl
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward") as f:
+            ipf = f.read().strip() == "1"
+        with open("/proc/sys/net/bridge/bridge-nf-call-iptables") as f:
+            bri = f.read().strip() == "1"
+        GAUGES["sysctl_ok"].set(1 if (ipf and bri) else 0)
+    except Exception:
+        GAUGES["sysctl_ok"].set(0)
+    # kernel modules
+    try:
+        with open("/proc/modules") as f:
+            mods = f.read()
+        ok = all(f"{m} " in mods or f"\n{m} " in mods for m in ("overlay", "br_netfilter"))
+        GAUGES["kernel_ok"].set(1 if ok else 0)
+    except Exception:
+        GAUGES["kernel_ok"].set(0)
+    # services
+    for svc, g in (("kubelet", "kubelet_active"), ("containerd", "containerd_active")):
+        try:
+            r = subprocess.run(["systemctl", "is-active", svc],
+                               capture_output=True, text=True, timeout=5)
+            GAUGES[g].set(1 if r.stdout.strip() == "active" else 0)
+        except Exception:
+            GAUGES[g].set(0)
+
+# ─── Main loop ────────────────────────────────────
+CHECKS = [
+    ("nodes",     check_nodes),
+    ("cp",        check_control_plane),
+    ("readyz",    check_readyz),
+    ("etcd",      check_etcd),
+    ("certs",     check_certs),
+    ("coredns",   check_coredns),
+    ("kubeproxy", check_kubeproxy),
+    ("cni",       check_cni),
+    ("workloads", check_workloads),
+    ("storage",   check_storage),
+    ("webhooks",  check_webhooks),
+    ("api",       check_api_latency),
+    ("host",      check_host),
+]
+
+def run_cycle():
+    t0 = time.monotonic()
+    errors = 0
+    for name, fn in CHECKS:
+        try:
+            fn()
+        except Exception as e:
+            errors += 1
+            ERRORS.labels(check=name).inc()
+            log.warning("check %s failed: %s", name, e)
+    GAUGES["cycle_duration"].set(time.monotonic() - t0)
+    GAUGES["exporter_up"].set(1 if errors == 0 else 0)
+    if errors == 0:
+        GAUGES["last_success"].set(time.time())
+    log.info("cycle done in %.2fs, errors=%d", time.monotonic() - t0, errors)
+
+def main():
+    log.info("starting exporter on :%d interval=%ds kubeconfig=%s",
+             PORT, INTERVAL, KUBECONFIG)
+    start_http_server(PORT)
+
+    def loop():
+        while True:
+            try:
+                run_cycle()
+            except Exception as e:
+                log.error("cycle crashed: %s", e)
+                GAUGES["exporter_up"].set(0)
+            time.sleep(INTERVAL)
+
+    run_cycle()  # first check immediately
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    while True:
+        time.sleep(3600)
+
+if __name__ == "__main__":
+    main()
+
+📄 ۳. requirements.txt
+txt
+
+prometheus_client>=0.19.0,<1.0
+
+📄 ۴. k8s-health-exporter.service
+ini
+
+[Unit]
+Description=Kubernetes Health Prometheus Exporter
+After=network-online.target kubelet.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment="KUBECONFIG=/etc/kubernetes/admin.conf"
+Environment="CHECK_INTERVAL=60"
+Environment="METRIC_PORT=9876"
+Environment="LOG_LEVEL=INFO"
+ExecStart=/usr/bin/python3 /opt/k8s-monitor/k8s_health_exporter.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+📄 ۵. prometheus-scrape.yml (به prometheus.yml اضافه کن)
+yaml
+
+scrape_configs:
+  - job_name: 'k8s-health'
+    scrape_interval: 60s
+    scrape_timeout: 30s
+    static_configs:
+      - targets:
+          - 'master1:9876'
+          - 'master2:9876'
+          - 'master3:9876'
+        labels:
+          cluster: production
+          role: control-plane
+      - targets:
+          - 'worker1:9876'
+          - 'worker2:9876'
+        labels:
+          cluster: production
+          role: worker
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '([^:]+):.*'
+        target_label: instance
+        replacement: '${1}'
+
+📄 ۶. alerting-rules.yml (PrometheusRule)
+yaml
+
+groups:
+  - name: k8s-health-critical
+    interval: 30s
+    rules:
+      # ─── Self-monitoring ───
+      - alert: K8sHealthExporterDown
+        expr: up{job="k8s-health"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Health exporter on {{ $labels.instance }} is down"
+          description: "Metrics unreachable for 2m"
+
+      - alert: K8sHealthCheckFailed
+        expr: k8s_health_exporter_up == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Health check cycles failing on {{ $labels.instance }}"
+
+      # ─── Cluster core ───
+      - alert: K8sNodeNotReady
+        expr: k8s_health_node_ready == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Node {{ $labels.node }} NotReady"
+          description: "Node {{ $labels.node }} has been NotReady for 2m"
+
+      - alert: K8sNodePressure
+        expr: k8s_health_node_pressure == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }} has {{ $labels.type }}"
+
+      - alert: K8sAPIServerDown
+        expr: k8s_health_readyz == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "API Server /readyz failing on {{ $labels.instance }}"
+
+      - alert: K8sControlPlanePodDown
+        expr: k8s_health_control_plane_pod_up == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Control plane component {{ $labels.component }} down"
+
+      # ─── etcd ───
+      - alert: K8sEtcdUnhealthy
+        expr: k8s_health_etcd_healthy == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "etcd unhealthy on {{ $labels.instance }}"
+
+      - alert: K8sEtcdNoLeader
+        expr: k8s_health_etcd_has_leader == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "etcd has no leader — quorum lost?"
+
+      - alert: K8sEtcdDbSizeHigh
+        expr: k8s_health_etcd_dbsize_bytes > 2 * 1024^3
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "etcd DB > 2GB ({{ $value | humanize1024 }}B) — compaction/defrag needed"
+
+      # ─── Certificates ───
+      - alert: K8sCertExpiringSoon
+        expr: k8s_health_cert_expires_days < 30
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Cert {{ $labels.name }} expires in {{ $value }}d"
+
+      - alert: K8sCertExpiringCritical
+        expr: k8s_health_cert_expires_days < 7
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "Cert {{ $labels.name }} expires in {{ $value }}d — RENEW NOW"
+
+      - alert: K8sCertExpired
+        expr: k8s_health_cert_expires_days < 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Cert {{ $labels.name }} EXPIRED {{ $value }}d ago"
+
+      # ─── Networking ───
+      - alert: K8sCoreDNSDown
+        expr: k8s_health_coredns_ready_ratio < 1
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "CoreDNS degraded ({{ $value | humanizePercentage }})"
+
+      - alert: K8sKubeProxyDegraded
+        expr: k8s_health_kubeproxy_ready_ratio < 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "kube-proxy degraded ({{ $value | humanizePercentage }})"
+
+      - alert: K8sCNIDegraded
+        expr: k8s_health_cni_ready_ratio < 1
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "CNI {{ $labels.name }} degraded ({{ $value | humanizePercentage }})"
+
+      # ─── Workloads ───
+      - alert: K8sPodCrashLoop
+        expr: k8s_health_pod_unhealthy{phase=~"CrashLoopBackOff|Error|ImagePullBackOff|ErrImagePull"} == 1
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} in {{ $labels.phase }} for 15m"
+
+      - alert: K8sPodHighRestarts
+        expr: k8s_health_pod_restarts > 5
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} has {{ $value }} restarts"
+
+      - alert: K8sDeploymentNotReady
+        expr: k8s_health_deployment_ready_ratio < 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Deployment {{ $labels.namespace }}/{{ $labels.name }} {{ $value | humanizePercentage }} ready"
+
+      - alert: K8sStatefulSetNotReady
+        expr: k8s_health_sts_ready_ratio < 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "StatefulSet {{ $labels.namespace }}/{{ $labels.name }} {{ $value | humanizePercentage }} ready"
+
+      # ─── Storage ───
+      - alert: K8sPVCUnbound
+        expr: k8s_health_pvc_unbound_count > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} PVCs are not Bound for 15m"
+
+      - alert: K8sVolumeAttachmentStuck
+        expr: k8s_health_volumeattachment_stuck_count > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} VolumeAttachments stuck"
+
+      # ─── API ───
+      - alert: K8sAPILatencyHigh
+        expr: k8s_health_api_latency_seconds > 3
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "API latency {{ $value }}s on {{ $labels.instance }}"
+
+      # ─── Host-level ───
+      - alert: K8sDiskUsageHigh
+        expr: k8s_health_disk_usage_ratio > 0.85
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "Disk {{ $labels.path }} usage {{ $value | humanizePercentage }} on {{ $labels.instance }}"
+
+      - alert: K8sSwapActive
+        expr: k8s_health_swap_active == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Swap enabled on {{ $labels.instance }} — kubelet may fail"
+
+      - alert: K8sSysctlBroken
+        expr: k8s_health_sysctl_ok == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Critical sysctl not set on {{ $labels.instance }}"
+
+      - alert: K8sKubeletDown
+        expr: k8s_health_kubelet_active == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "kubelet inactive on {{ $labels.instance }}"
+
+      - alert: K8sContainerdDown
+        expr: k8s_health_containerd_active == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "containerd inactive on {{ $labels.instance }}"
+
+📄 ۷. alertmanager.yml
+yaml
+
+global:
+  resolve_timeout: 5m
+  slack_api_url: 'https://hooks.slack.com/services/XXX/YYY/ZZZ'
+
+route:
+  receiver: 'slack-warnings'
+  group_by: ['alertname', 'cluster', 'instance']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="critical"']
+      receiver: 'critical-multi'
+      group_wait: 10s
+      repeat_interval: 1h
+    - matchers: ['severity="warning"']
+      receiver: 'slack-warnings'
+
+inhibit_rules:
+  # اگر API Server down است، هشدارهای pod/pvc بی‌معنی هستند
+  - source_matchers: ['alertname="K8sAPIServerDown"']
+    target_matchers: ['severity=~"warning|critical"']
+    equal: ['instance']
+  # اگر Node NotReady، هشدارهای pod روی همان نود را suppress کن
+  - source_matchers: ['alertname="K8sNodeNotReady"']
+    target_matchers: ['alertname=~"K8sPod.*|K8sDeployment.*"']
+    equal: ['node']
+
+receivers:
+  - name: 'slack-warnings'
+    slack_configs:
+      - channel: '#k8s-alerts'
+        send_resolved: true
+        title: '{{ .Status | toUpper }} — {{ .CommonLabels.alertname }}'
+        text: |
+          *Severity*: {{ .CommonLabels.severity }}
+          *Instance*: {{ .CommonLabels.instance }}
+          {{ range .Alerts -}}
+          • {{ .Annotations.summary }}
+          {{ end }}
+
+  - name: 'critical-multi'
+    slack_configs:
+      - channel: '#k8s-critical'
+        send_resolved: true
+        title: '🚨 CRITICAL — {{ .CommonLabels.alertname }}'
+        text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ end }}'
+    webhook_configs:
+      - url: 'https://api.telegram.org/bot<BOT_TOKEN>/sendMessage?chat_id=<CHAT_ID>'
+        send_resolved: true
+
+    نکته Telegram: Alertmanager از پیلود Slack-مثل پشتیبانی نمی‌کند؛ بهتر است یک webhook adapter بین Alertmanager و Telegram بگذاری (مثلاً prometheus-webhook-telegram). در ادامه، مسیر ساده با notify.sh را نشان می‌دهم که مستقیم از cron استفاده می‌کند.
+
+📄 ۸. notify.sh — برای مسیر ساده (cron)
+bash
+
+#!/usr/bin/env bash
+# notify.sh — خواندن health.json و ارسال هشدار در صورت critical/warning
+set -euo pipefail
+
+HEALTH_JSON="${HEALTH_JSON:-/var/log/k8s-health/health.json}"
+TELEGRAM_TOKEN="${TELEGRAM_TOKEN:-}"
+TELEGRAM_CHAT="${TELEGRAM_CHAT:-}"
+SLACK_WEBHOOK="${SLACK_WEBHOOK:-}"
+EMAIL_TO="${EMAIL_TO:-}"
+
+[[ -f "$HEALTH_JSON" ]] || { echo "no health.json"; exit 1; }
+
+status=$(jq -r .status "$HEALTH_JSON")
+criticals=$(jq -r '.criticals | join("\n• ")' "$HEALTH_JSON")
+warnings=$(jq -r '.warnings | join("\n• ")' "$HEALTH_JSON")
+
+[[ "$status" == "healthy" ]] && exit 0
+
+host=$(hostname)
+ts=$(date -u +%FT%TZ)
+if [[ "$status" == "critical" ]]; then
+  icon="🔴"; title="CRITICAL"
+else
+  icon="🟡"; title="WARNING"
+fi
+
+msg="*${icon} K8s Health ${title}* — ${host}
+\`${ts}\`
+
+*Criticals:*
+• ${criticals:-none}
+
+*Warnings:*
+• ${warnings:-none}"
+
+# Slack
+if [[ -n "$SLACK_WEBHOOK" ]]; then
+  curl -sS -X POST -H 'Content-type: application/json' \
+    --data "$(jq -n --arg t "$msg" '{text:$t}')" "$SLACK_WEBHOOK" >/dev/null || true
+fi
+
+# Telegram
+if [[ -n "$TELEGRAM_TOKEN" && -n "$TELEGRAM_CHAT" ]]; then
+  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+    -d chat_id="$TELEGRAM_CHAT" \
+    -d parse_mode=Markdown \
+    --data-urlencode text="$msg" >/dev/null || true
+fi
+
+# Email (requires mailutils)
+if [[ -n "$EMAIL_TO" ]] && command -v mail >/dev/null; then
+  echo -e "$msg" | mail -s "[K8s $title] $host" "$EMAIL_TO" || true
+fi
+
+📄 ۹. install.sh — نصب همه
+bash
+
+#!/usr/bin/env bash
+set -euo pipefail
+DIR=/opt/k8s-monitor
+mkdir -p "$DIR" /var/log/k8s-health
+
+# 1. dependencies
+apt-get update -qq
+apt-get install -y -qq python3 python3-pip jq curl >/dev/null
+pip3 install --quiet -r "$DIR/requirements.txt" 2>/dev/null || \
+  pip3 install --break-system-packages --quiet -r "$DIR/requirements.txt"
+
+# 2. bash script
+chmod +x "$DIR/k8s-health-check.sh" "$DIR/notify.sh"
+
+# 3. systemd
+cp "$DIR/k8s-health-exporter.service" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now k8s-health-exporter.service
+
+# 4. cron (optional — simple path)
+cat >/etc/cron.d/k8s-health <<EOF
+*/5 * * * * root $DIR/k8s-health-check.sh >/dev/null 2>&1
+*/5 * * * * root sleep 15 && $DIR/notify.sh >/dev/null 2>&1
+EOF
+chmod 644 /etc/cron.d/k8s-health
+
+# 5. firewall (optional — برای scrape شدن exporter)
+command -v ufw >/dev/null && ufw allow from 10.0.0.0/8 to any port 9876 proto tcp || true
+
+echo "✅ installed. exporter: http://$(hostname):9876/metrics"
+echo "   logs: journalctl -u k8s-health-exporter -f"
+echo "   health.json: /var/log/k8s-health/health.json"
+
+🔧 اعتبارسنجی و گام‌به‌گام
+bash
+
+# ۱. تست دستی exporter
+python3 /opt/k8s-monitor/k8s_health_exporter.py
+# در ترمینال دیگر:
+curl -s localhost:9876/metrics | head -40
+curl -s localhost:9876/metrics | grep -E "node_ready|coredns_ratio|kubelet_active"
+
+# ۲. تست bash check
+/opt/k8s-monitor/k8s-health-check.sh
+echo "exit=$?"
+cat /var/log/k8s-health/health.json | jq .
+
+# ۳. تست سرویس
+systemctl status k8s-health-exporter --no-pager
+journalctl -u k8s-health-exporter -n 20 --no-pager
+
+# ۴. اعتبارسنجی Prometheus rules
+promtool check rules /etc/prometheus/alerting-rules.yml
+promtool check config /etc/prometheus/prometheus.yml
+
+# ۵. اعتبارسنجی Alertmanager
+amtool check-config /etc/alertmanager/alertmanager.yml
+
+# ۶. تست scrape
+curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job=="k8s-health")'
+
+📊 نمونه PromQL برای Grafana
+promql
+
+# ── داشبورد Cluster Overview ──
+# نودهای Ready
+sum(k8s_health_node_ready)
+
+# درصد نودهای Ready
+avg(k8s_health_node_ready) * 100
+
+# تعداد Podهای ناسالم
+sum(k8s_health_pod_unhealthy)
+
+# نرخ خطای Health Check
+rate(k8s_health_check_errors_total[5m])
+
+# ── Control Plane ──
+# همگی CP Podها بالا؟
+min(k8s_health_control_plane_pod_up) by (component)
+
+# etcd size (GB)
+k8s_health_etcd_dbsize_bytes / 1024^3
+
+# ── Certificates ──
+# کمترین روز تا انقضا
+min(k8s_health_cert_expires_days)
+
+# ── Workloads ──
+# Deployهای ناسالم
+sum(k8s_health_deployment_ready_ratio < 1)
+
+# Top 10 podهایی با بیشترین restart
+topk(10, k8s_health_pod_restarts)
+
+# ── Networking ──
+k8s_health_coredns_ready_ratio
+k8s_health_kubeproxy_ready_ratio
+k8s_health_cni_ready_ratio
+
+# ── API Latency (p50/p95/p99) ──
+histogram_quantile(0.50, rate(kubectl_get_nodes_latency_bucket[5m]))   # اگر histogram استفاده می‌کردی
+k8s_health_api_latency_seconds
+
+# ── Storage ──
+sum(k8s_health_pvc_unbound_count)
+k8s_health_volumeattachment_stuck_count
+
+# ── Host ──
+max by (instance,path) (k8s_health_disk_usage_ratio)
+k8s_health_swap_active
+k8s_health_sysctl_ok
+
+Grafana Dashboard Layout پیشنهادی
+text
+
+Row 1: Overview
+├─ [Stat] Nodes Ready           → sum(k8s_health_node_ready)
+├─ [Stat] Unhealthy Pods        → sum(k8s_health_pod_unhealthy)
+├─ [Stat] Cert Min Days         → min(k8s_health_cert_expires_days)
+└─ [Stat] API Latency           → avg(k8s_health_api_latency_seconds)
+
+Row 2: Control Plane & etcd
+├─ [Table] CP Pods              → min by (instance,component)(k8s_health_control_plane_pod_up)
+├─ [Time series] etcd DB Size   → k8s_health_etcd_dbsize_bytes / 1024^3
+└─ [Stat] etcd Leader           → k8s_health_etcd_has_leader
+
+Row 3: Networking
+├─ [Gauge] CoreDNS Ratio        → k8s_health_coredns_ready_ratio
+├─ [Gauge] kube-proxy Ratio     → k8s_health_kubeproxy_ready_ratio
+└─ [Table] CNI Ratio            → k8s_health_cni_ready_ratio
+
+Row 4: Workloads
+├─ [Table] Deployments < 100%   → k8s_health_deployment_ready_ratio < 1
+└─ [Bar gauge] Top Restarts     → topk(10, k8s_health_pod_restarts)
+
+Row 5: Host
+├─ [Stat] Disk Usage Max        → max(k8s_health_disk_usage_ratio)
+└─ [Stat] Swap/Kubelet/Containerd → هر سه فعال؟
+
+🩺 عیب‌یابی خود Exporter
+علامت	بررسی
+k8s_health_exporter_up == 0	journalctl -u k8s-health-exporter -n 50 → کدام check error می‌دهد
+up{job=k8s-health} == 0	فایروال پورت 9876، یا سرویس down
+Metrics خالی	curl localhost:9876/metrics → اگر خالی، KUBECONFIG درست نیست
+kubectl not found	KUBECTL=/usr/local/bin/kubectl را در systemd env اصلاح کن
+permission denied روی kubeconfig	chmod 600 /etc/kubernetes/admin.conf + User=root
+k8s_health_check_errors_total{check=...} بالا	همان check مشکل دارد؛ با دستور دستی همان چک را اجرا کن
+📋 جدول جمع‌بندی — کدام مسیر برای چه کسی؟
+سناریو	مسیر توصیه‌شده
+کلاستر production با Prometheus موجود	Exporter + Alertmanager
+تیم کوچک، سرور تک‌نودی	Cron + notify.sh
+می‌خواهی از هر دو داشته باشی	هر دو (bash check هر ۵ دقیقه + exporter ۶۰s)
+کلاستر بدون Prometheus	Cron + notify.sh
+نیاز به Grafana dashboard	Exporter (بدون گزینه‌ی دوم امکان‌پذیر نیست)
+نیاز به alert روی trend (مثل cert expiry پیش‌رونده)	Exporter
+🎯 چک‌لیست نهایی پس از نصب
+text
+
+[ ] exporter روی هر master و worker اجرا می‌شود (systemd active)
+[ ] curl :9876/metrics از روی master جواب می‌دهد
+[ ] Prometheus target job=k8s-health همه UP هستند
+[ ] alerting-rules.yml در promtool پاس شد
+[ ] Alertmanager config در amtool پاس شد
+[ ] یک آلارم تستی (K8sSwapActive روی یک worker تست) به Slack/Telegram رسید
+[ ] inhibitor ها کار می‌کنند (API down → pod alert suppress)
+[ ] rate(k8s_health_check_errors_total[5m]) == 0 در حالت پایدار
+[ ] dashboard گرافانا همه row ها را نمایش می‌دهد
+
+ 

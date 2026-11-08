@@ -1,0 +1,114 @@
+﻿🌳 درخت خطاهای رایج کوبرنتیز
+🚨 ۱. خطاهای سطح Pod (برنامه و کانتینر)
+
+    CrashLoopBackOff : پاد به طور مکرر راه‌اندازی می‌شود و بلافاصله کرش می‌کند.
+
+        علت فنی: برنامه در زمان استارت با خطا مواجه می‌شود (خطای پیکربندی، عدم دسترسی به دیتابیس، یا خطای کد). همچنین پروب‌های (Probes) خیلی سخت‌گیرانه یا دستور (Command) اشتباه در مانیفست می‌تواند باعث آن شود. کد خروج (Exit Code) 137 معمولاً نشانه‌ی OOMKilled است.
+
+        روش رفع:
+
+            لاگ کانتینر کرش‌کرده را با kubectl logs <pod> --previous بررسی کنید.
+
+            با kubectl describe pod <pod> رویدادها (Events) را ببینید.
+
+            مقادیر initialDelaySeconds و failureThreshold پروب‌ها را افزایش دهید تا برنامه فرصت استارت داشته باشد.
+
+    ImagePullBackOff / ErrImagePull : kubelet قادر به دریافت ایمیج کانتینر نیست.
+
+        علت فنی: نام یا تگ ایمیج اشتباه است، رجیستری نیاز به احراز هویت دارد و imagePullSecret تنظیم نشده، یا محدودیت نرخ (Rate Limit) رجیستری (مثل Docker Hub) فعال شده است.
+
+        روش رفع:
+
+            صحت وجود ایمیج را به صورت دستی با docker pull <image> بررسی کنید.
+
+            در صورت نیاز به رجیستری خصوصی، با kubectl create secret docker-registry regcred ... سکرت ساخته و در بخش imagePullSecrets مانیفست پاد به آن ارجاع دهید.
+
+    OOMKilled (کد خروج 137) : کانتینر به دلیل مصرف بیش از حد حافظه توسط کرنل سیستم‌عامل کشته می‌شود.
+
+        علت فنی: برنامه دارای نشتی حافظه (Memory Leak) است یا limits.memory کانتینر برای بار کاری آن خیلی کم تعریف شده است.
+
+        روش رفع: مقدار limits.memory را به صورت محتاطانه افزایش دهید، یا با پروفایل کردن برنامه، نشتی حافظه را برطرف کنید. مقادیر requests و limits را بهینه کنید.
+
+    CreateContainerConfigError : پاد به دلیل مشکل در پیکربندی، قبل از استارت کانتینر متوقف می‌شود.
+
+        علت فنی: ConfigMap یا Secret ارجاع‌داده‌شده در مانیفست وجود ندارد، یا کلید (Key) مشخص‌شده در آن‌ها تعریف نشده است. همچنین عدم تطابق namespace نیز می‌تواند دلیل باشد.
+
+        روش رفع: با kubectl describe pod پیام خطا را بخوانید، سپس منبع گم‌شده را بسازید یا ارجاع را در مانیفست اصلاح کنید.
+
+    Pending (گیر کردن در حالت انتظار) : پاد برای اجرا به هیچ نودی تخصیص داده نمی‌شود.
+
+        علت فنی: منابع کافی (CPU/حافظه) در کلاستر وجود ندارد، محدودیت‌های nodeSelector، affinity یا taint اجازه‌ی زمان‌بندی نمی‌دهند، یا PVC مربوطه در حالت Pending است.
+
+        روش رفع: با kubectl describe pod رویداد FailedScheduling را بررسی کنید. در صورت کمبود منابع، requests را کاهش دهید یا نود جدید اضافه کنید. taintها و affinityها را بررسی کنید.
+
+    Terminating (گیر کردن در حالت حذف) : پاد برای حذف علامت‌گذاری شده اما کنترل‌پلین نمی‌تواند آن را پاک کند.
+
+        علت فنی: پاد دارای finalizer است و یک admission webhook معیوب از حذف آن جلوگیری می‌کند، یا kubelet روی نود پاسخ‌گو نیست.
+
+        روش رفع: وجود ValidatingWebhookConfiguration یا MutatingWebhookConfiguration مشکل‌دار را بررسی کنید. در موارد حاد، می‌توانید از --force --grace-period=0 استفاده کنید.
+
+🚨 ۲. خطاهای سطح Node (زیرساخت و Kubelet)
+
+    NotReady (نود آماده نیست) : kubelet نود heartbeat خود را به کنترل‌پلین ارسال نمی‌کند.
+
+        علت فنی: سرویس kubelet متوقف شده، پلاگین CNI به درستی پیکربندی نشده، یا نود دچار فشار منابع (MemoryPressure، DiskPressure، PIDPressure) است.
+
+        روش رفع: با journalctl -u kubelet لاگ را بررسی کنید. وضعیت df -h را برای DiskPressure و crictl ps را برای runtime چک کنید. در صورت لزوم نود را cordon و drain کنید.
+
+    DiskPressure (فشار دیسک) : فضای دیسک نود به زیر آستانه‌ی eviction رسیده است.
+
+        علت فنی: تجمع ایمیج‌های بدون استفاده، لاگ‌های حجیم کانتینرها یا فایل‌های موقت (ephemeral storage) باعث پر شدن دیسک شده است.
+
+        روش رفع: با crictl rmi --prune ایمیج‌های بی‌استفاده را پاک کنید و لاگ‌ها را پاکسازی یا rotate کنید. در مانیفست پادها ephemeral-storage را محدود کنید.
+
+🚨 ۳. خطاهای شبکه و سرویس (DNS, Service, Ingress)
+
+    خطای DNS (عدم resolve شدن نام سرویس) : پاد نمی‌تواند نام سرویس‌های داخلی را resolve کند.
+
+        علت فنی: پادهای CoreDNS در حال اجرا نیستند (CrashLoop)، یا ConfigMap مربوط به CoreDNS خراب شده، یا NetworkPolicy ترافیک DNS (پورت 53) را مسدود کرده است.
+
+        روش رفع: سلامت CoreDNS را با kubectl get pods -n kube-system -l k8s-app=kube-dns بررسی کنید. صحت resolve را با یک پاد موقت تست کنید: kubectl run tmp --image=busybox --rm -it -- nslookup kubernetes.default.
+
+    Endpoints خالی برای سرویس : سرویس به هیچ پادی مسیر ندارد.
+
+        علت فنی: selector سرویس با labels پادها مطابقت ندارد، یا پادها به دلیل شکست readinessProbe در وضعیت Ready نیستند.
+
+        روش رفع: با kubectl get endpoints <service> خالی بودن را تأیید کنید. سپس selector سرویس را با labels پادها تطبیق دهید و سلامت readinessProbe را بررسی کنید.
+
+    خطای 502 / 504 از Ingress : Ingress Controller نمی‌تواند به سرویس بک‌اند متصل شود یا پاسخ به موقع دریافت نمی‌کند.
+
+        علت فنی: Endpoints سرویس بک‌اند خالی است، targetPort در سرویس اشتباه است، یا پادها در حال restart هستند و preStop hook مناسبی برای تخلیه‌ی اتصالات ندارند.
+
+        روش رفع: ابتدا وجود Endpoints را بررسی کنید. targetPort را با پورت کانتینر تطبیق دهید. برای جلوگیری از خطا در زمان rolling update، یک preStop hook با sleep تعریف کنید.
+
+🚨 ۴. خطاهای ذخیره‌سازی (Storage)
+
+    PVC در حالت Pending : درخواست فضای ذخیره‌سازی نمی‌تواند به یک PV متصل شود.
+
+        علت فنی: StorageClass وجود ندارد یا نام آن اشتباه است، provisioner قادر به ساخت volume نیست، یا accessMode درخواستی با PV موجود سازگار نیست.
+
+        روش رفع: با kubectl describe pvc <pvc-name> رویدادها را ببینید. با kubectl get storageclass وجود کلاس را تأیید کنید. در صورت استفاده از WaitForFirstConsumer، تا زمان زمان‌بندی پاد، PVC در حالت Pending باقی می‌ماند که طبیعی است.
+
+    FailedMount / FailedAttachVolume : Volume ساخته شده اما به پاد mount نمی‌شود.
+
+        علت فنی: پادهای درایور CSI در حال اجرا نیستند، بک‌اند ذخیره‌سازی در دسترس نیست، یا مشکل در سطح فایل‌سیستم وجود دارد (مثلاً نیاز به fsck).
+
+        روش رفع: وضعیت VolumeAttachment را بررسی کنید. از اجرای پادهای CSI مطمئن شوید. در صورت خطای فایل‌سیستم، ممکن است نیاز به repair دستی روی نود داشته باشید.
+
+🚨 ۵. خطاهای کنترل‌پلین (Control Plane) و دسترسی (RBAC)
+
+    خطای Forbidden (RBAC) : کاربر یا ServiceAccount مجوز انجام عمل درخواستی را ندارد.
+
+        علت فنی: یک Role/ClusterRole و RoleBinding/ClusterRoleBinding مناسب برای آن هویت تعریف نشده است. تطبیق رشته‌ای (Case-Sensitive) نام کاربر در binding بسیار حساس است.
+
+        روش رفع: از دستور kubectl auth can-i <verb> <resource> --as=<user-or-sa> برای تست استفاده کنید. سپس binding مناسب را با kubectl create rolebinding بسازید.
+
+    خطاهای etcd و kube-apiserver : اجزای کنترل‌پلین در دسترس نیستند.
+
+        علت فنی: از دست رفتن quorum در etcd (به دلیل خرابی دیسک یا شبکه)، انقضای certificateها، یا وجود webhook معیوب که apiserver را بلاک می‌کند.
+
+        روش رفع: وضعیت etcd را با etcdctl endpoint health بررسی کنید. انقضای certificateها را با kubeadm certs check-expiration چک کنید. لاگ kube-apiserver را برای خطاهای webhook بررسی کنید.
+
+💡 جمع‌بندی: استراتژی کلی عیب‌یابی
+
+در بیش از ۸۰٪ موارد، دو دستور kubectl describe pod <pod> و kubectl logs <pod> --previous ریشه‌ی مشکل را نشان می‌دهند. همیشه از لایه‌ی اپلیکیشن به سمت زیرساخت حرکت کنید: ابتدا وضعیت پاد، سپس رویدادهای نود، و در نهایت سلامت سرویس‌ها و کنترل‌پلین را بررسی کنید.

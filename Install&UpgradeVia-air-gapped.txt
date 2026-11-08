@@ -1,0 +1,1239 @@
+﻿📦 بخش ۱: نصب Air-Gapped (بدون اینترنت)
+
+    سناریو: کلاستر production در محیط ایزوله. تمام artifact ها ابتدا روی bastion (با اینترنت) جمع می‌شوند، سپس به محیط ایزوله منتقل می‌شوند.
+
+🗺️ معماری Air-Gapped
+text
+
+┌────────────────────┐              ┌─────────────────────┐
+│  BASTION (internet)│              │  ISOLATED DC        │
+│                    │   USB/DVD    │                     │
+│  - Downloads       │─────────────▶│  - bastion-local    │
+│  - Bundle builder  │              │  - registry.local   │
+│                    │              │    (Harbor)         │
+└────────────────────┘              │  - master1/2/3      │
+                                    │  - worker1/2        │
+                                    └─────────────────────┘
+
+Artifact های لازم:
+نوع	مورد	حجم تقریبی
+.deb	containerd, runc, kubelet, kubeadm, kubectl, crictl	~100MB
+Image	kube-apiserver, controller-manager, scheduler, proxy, pause, etcd, coredns	~1.5GB
+Image	Calico (یا Cilium)	~500MB
+Image	CSI Driver (اگر لازم)	~200MB
+Manifest	kubeadm, calico, networkpolicy	~50KB
+Binary	helm, crictl, etcdctl	~150MB
+🔧 فاز ۱: آماده‌سازی Bundle روی Bastion
+۱.۱ — ساختار دایرکتوری
+bash
+
+mkdir -p /opt/k8s-bundle/{deb,bin,images,manifests,scripts}
+cd /opt/k8s-bundle
+
+# تعیین نسخه‌ها
+export K8S_VERSION="v1.31.2"
+export K8S_MINOR="1.31"
+export CONTAINERD_VERSION="1.7.22"
+export RUNC_VERSION="v1.1.14"
+export CNI_VERSION="v1.5.1"
+export CRICTL_VERSION="v1.31.1"
+export CALICO_VERSION="v3.28.2"
+export HELM_VERSION="v3.16.2"
+export ARCH="amd64"
+
+۱.۲ — دانلود .deb packages
+bash
+
+# ساخت repo محلی موقت
+mkdir -p /opt/k8s-bundle/deb
+cd /opt/k8s-bundle/deb
+
+# Kubernetes repo
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/Release.key | \
+  gpg --dearmor -o /tmp/kubernetes-apt-keyring.gpg
+
+cat > /etc/apt/sources.list.d/kubernetes.list <<EOF
+deb [signed-by=/tmp/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/ /
+EOF
+
+# containerd repo (Docker)
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+  gpg --dearmor -o /tmp/docker-apt-keyring.gpg
+cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [signed-by=/tmp/docker-apt-keyring.gpg] https://download.docker.com/linux/ubuntu jammy stable
+EOF
+
+apt-get update
+
+# دانلود همه package ها با dependency
+apt-get install -y --download-only --print-uris \
+  kubelet kubeadm kubectl containerd.io 2>&1 | \
+  awk -F"'" '/^.?http/ {print $2}' > /tmp/urls.txt
+
+# دانلود واقعی:
+cd /opt/k8s-bundle/deb
+cat /tmp/urls.txt | xargs -I{} -P5 wget -q {}
+
+# ✅ چک:
+ls /opt/k8s-bundle/deb/*.deb | wc -l
+# انتظار: 15-25 فایل
+
+dpkg-deb -W --showformat='${Package} ${Version}\n' /opt/k8s-bundle/deb/*.deb | \
+  grep -E "kubelet|kubeadm|kubectl|containerd"
+# انتظار: kubelet 1.31.2-1.1  kubeadm 1.31.2-1.1  kubectl 1.31.2-1.1  containerd.io 1.7.22-1
+
+۱.۳ — دانلود binairies
+bash
+
+cd /opt/k8s-bundle/bin
+
+# runc
+wget https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.${ARCH}
+
+# crictl
+wget https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${ARCH}.tar.gz
+
+# CNI plugins
+wget https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${ARCH}-${CNI_VERSION}.tgz
+
+# helm
+wget https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz
+
+# etcdctl (همان نسخه bundled)
+ETCD_VERSION=$(curl -s https://api.github.com/repos/etcd-io/etcd/releases/latest | \
+  grep tag_name | cut -d'"' -f4)
+wget https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-${ARCH}.tar.gz
+
+# ✅ چک:
+ls -la /opt/k8s-bundle/bin/
+# انتظار: runc, crictl-*.tar.gz, cni-plugins-*.tgz, helm-*.tar.gz, etcd-*.tar.gz
+
+۱.۴ — جمع‌آوری image ها (روش توصیه‌شده)
+bash
+
+cd /opt/k8s-bundle/images
+
+# ۱. image های kubeadm — لیست کامل:
+kubeadm config images list --kubernetes-version=${K8S_VERSION} > /tmp/kubeadm-images.txt
+cat /tmp/kubeadm-images.txt
+# انتظار:
+#   registry.k8s.io/kube-apiserver:v1.31.2
+#   registry.k8s.io/kube-controller-manager:v1.31.2
+#   registry.k8s.io/kube-scheduler:v1.31.2
+#   registry.k8s.io/kube-proxy:v1.31.2
+#   registry.k8s.io/pause:3.10
+#   registry.k8s.io/etcd:3.5.15-0
+#   registry.k8s.io/coredns/coredns:v1.11.1
+
+# ۲. image های Calico:
+CALICO_IMAGES=$(curl -sL https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml | \
+  grep -E "^\s+image:" | awk '{print $2}' | sort -u)
+
+# یا دستی (اگر اینترنت محدود):
+cat > /tmp/calico-images.txt <<EOF
+quay.io/tigera/operator:v1.34.1
+quay.io/calico/node:v3.28.2
+quay.io/calico/cni:v3.28.2
+quay.io/calico/kube-controllers:v3.28.2
+quay.io/calico/typha:v3.28.2
+quay.io/calico/pod2daemon-flexvol:v3.28.2
+EOF
+
+# ۳. دانلود + save همه image ها (روی bastion باید docker یا podman داشته باشی):
+cat /tmp/kubeadm-images.txt /tmp/calico-images.txt | sort -u > /tmp/all-images.txt
+
+while IFS= read -r img; do
+  echo "→ $img"
+  docker pull "$img"
+  # نام فایل را از image path می‌سازیم
+  fname=$(echo "$img" | tr '/:' '__').tar
+  docker save "$img" -o "/opt/k8s-bundle/images/${fname}"
+done < /tmp/all-images.txt
+
+# ✅ چک:
+ls -lh /opt/k8s-bundle/images/*.tar | wc -l
+# انتظار: تعداد = خطوط /tmp/all-images.txt
+
+du -sh /opt/k8s-bundle/images/
+# انتظار: ~2.5GB
+
+# بررسی صحت tar:
+for f in /opt/k8s-bundle/images/*.tar; do
+  tar tf "$f" manifest.json >/dev/null 2>&1 || echo "❌ corrupt: $f"
+done
+# انتظار: هیچ خروجی (همه سالم)
+
+۱.۵ — دانلود manifest ها
+bash
+
+cd /opt/k8s-bundle/manifests
+
+# Calico
+curl -LO https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml
+curl -LO https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/custom-resources.yaml
+
+# Cilium (جایگزین — اختیاری)
+curl -LO https://raw.githubusercontent.com/cilium/cilium/1.16.3/install/kubernetes/quick-install.yaml
+
+# metrics-server (اختیاری)
+curl -LO https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# ✅ چک:
+grep "image:" tigera-operator.yaml | head -5
+# انتظار: image: quay.io/tigera/operator:v1.34.1
+
+۱.۶ — ساخت checksum و بسته‌بندی
+bash
+
+cd /opt/k8s-bundle
+
+# checksum همه فایل‌ها
+find . -type f ! -name SHA256SUMS -exec sha256sum {} \; > SHA256SUMS
+wc -l SHA256SUMS
+# انتظار: تعداد تمام فایل‌های bundle
+
+# بسته‌بندی
+cd /opt
+tar czf k8s-bundle-v1.31.2.tar.gz k8s-bundle/
+
+ls -lh /opt/k8s-bundle-v1.31.2.tar.gz
+# انتظار: ~2.5GB
+
+# checksum نهایی (برای انتقال امن)
+sha256sum /opt/k8s-bundle-v1.31.2.tar.gz | tee /opt/k8s-bundle-v1.31.2.tar.gz.sha256
+
+۱.۷ — انتقال به محیط ایزوله
+bash
+
+# روی bastion اینترنتی → USB یا scp به bastion ایزوله:
+scp /opt/k8s-bundle-v1.31.2.tar.gz \
+    /opt/k8s-bundle-v1.31.2.tar.gz.sha256 \
+    user@bastion-local.internal:/opt/
+
+# روی bastion ایزوله — اعتبارسنجی:
+sha256sum -c /opt/k8s-bundle-v1.31.2.tar.gz.sha256
+# انتظار: /opt/k8s-bundle-v1.31.2.tar.gz: OK
+
+cd /opt
+tar xzf k8s-bundle-v1.31.2.tar.gz
+cd k8s-bundle
+sha256sum -c SHA256SUMS 2>&1 | grep -v "OK$" | head -5
+# انتظار: هیچ خروجی (همه OK)
+
+🐳 فاز ۲: راه‌اندازی Registry خصوصی (Harbor)
+۲.۱ — نصب Harbor (بدون اینترنت)
+bash
+
+# دانلود Harbor bundle روی bastion اینترنتی:
+# https://github.com/goharbor/harbor/releases
+HARBOR_VERSION="v2.11.1"
+wget https://github.com/goharbor/harbor/releases/download/${HARBOR_VERSION}/harbor-offline-installer-${HARBOR_VERSION}.tgz
+
+# انتقال به bastion-local، سپس:
+cd /opt
+tar xzf harbor-offline-installer-${HARBOR_VERSION}.tgz
+cd harbor
+
+# کانفیگ
+cat > harbor.yml <<EOF
+hostname: registry.local
+http:
+  port: 80
+harbor_admin_password: Harbor12345!
+database:
+  password: root123
+  max_idle_conns: 100
+data_volume: /data/harbor
+trivy:
+  ignore_unfixed: false
+  skip_update: true
+  insecure: true
+jobservice:
+  max_job_workers: 10
+log:
+  level: info
+  local:
+    rotate_count: 50
+    rotate_size: 200M
+    location: /var/log/harbor
+_version: 2.11.0
+EOF
+
+./install.sh --with-trivy
+
+# ✅ چک:
+systemctl is-active harbor
+# انتظار: active
+curl -s http://registry.local/api/v2.0/health | jq .
+# انتظار: {"status":"healthy"}
+
+۲.۲ — ساخت project در Harbor
+bash
+
+# login
+docker login registry.local -u admin -p 'Harbor12345!'
+
+# ساخت project با API:
+curl -u admin:'Harbor12345!' -X POST http://registry.local/api/v2.0/projects \
+  -H "Content-Type: application/json" \
+  -d '{"project_name":"k8s","public":true}'
+
+# ✅ چک:
+curl -s -u admin:'Harbor12345!' http://registry.local/api/v2.0/projects | jq -r '.[].name'
+# انتظار: k8s
+
+۲.۳ — Push image ها به Harbor
+bash
+
+cd /opt/k8s-bundle/images
+
+# تابع کمکی برای retag + push
+for tarfile in *.tar; do
+  # خواندن source image از filename
+  src=$(echo "$tarfile" | sed 's/\.tar$//; s/__/\//g')
+  # نام جدید: registry.local/k8s/<name>:<tag>
+  basename=$(echo "$src" | awk -F/ '{print $NF}')
+  dst="registry.local/k8s/${basename}"
+
+  echo "→ $src → $dst"
+  docker load -i "$tarfile"
+  docker tag "$src" "$dst"
+  docker push "$dst"
+done
+
+# ✅ چک:
+curl -s -u admin:'Harbor12345!' \
+  "http://registry.local/api/v2.0/projects/k8s/repositories?page_size=100" | \
+  jq -r '.[].name' | sort
+# انتظار: k8s/etcd, k8s/kube-apiserver, k8s/kube-controller-manager,
+#         k8s/kube-proxy, k8s/kube-scheduler, k8s/pause, k8s/coredns,
+#         k8s/tigera-operator, k8s/node, k8s/cni, k8s/kube-controllers, ...
+
+🖥️ فاز ۳: نصب روی نودهای ایزوله
+۳.۱ — کپی bundle به همه نودها
+bash
+
+# از bastion-local به همه نودها:
+for node in master1 master2 master3 worker1 worker2; do
+  scp -r /opt/k8s-bundle root@${node}:/opt/
+done
+
+# روی هر نود، اعتبارسنجی:
+ssh root@master1 'cd /opt/k8s-bundle && sha256sum -c SHA256SUMS 2>&1 | grep -v OK$'
+# انتظار: هیچ خروجی
+
+۳.۲ — تنظیم OS (همان بخش ۱ از راهنمای قبلی، بدون تغییر)
+bash
+
+# روی هر نود:
+# swap off، kernel modules، sysctl، firewall، hosts، NTP
+# دقیقاً مثل بخش ۱ راهنمای قبلی — فقط بدون apt-get از اینترنت
+
+۳.۳ — نصب containerd از bundle
+bash
+
+# روی هر نود:
+cd /opt/k8s-bundle/deb
+
+# نصب از فایل‌های محلی:
+apt-get install -y --no-download --fix-missing \
+  ./containerd.io_*.deb
+
+# ✅ چک:
+dpkg -l | grep containerd.io
+# انتظار: ii  containerd.io  1.7.22-1  amd64
+systemctl is-active containerd
+# انتظار: active
+
+۳.۴ — نصب runc و CNI plugins
+bash
+
+cd /opt/k8s-bundle/bin
+
+# runc
+install -m 755 runc.${ARCH} /usr/local/sbin/runc
+runc --version | grep -q "1.1.14" && echo "✅ runc OK" || echo "❌ runc FAIL"
+
+# CNI plugins
+mkdir -p /opt/cni/bin
+tar Cxzvf /opt/cni/bin cni-plugins-linux-${ARCH}-${CNI_VERSION}.tgz
+ls /opt/cni/bin/ | grep -c "bridge\|loopback\|host-local"
+# انتظار: 3
+
+# crictl
+tar xzf crictl-${CRICTL_VERSION}-linux-${ARCH}.tar.gz -C /usr/local/bin/
+
+# کانفیگ crictl
+cat > /etc/crictl.yaml <<EOF
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
+EOF
+
+crictl version 2>&1 | grep -q "RuntimeName:  containerd" && \
+  echo "✅ crictl OK" || echo "❌ crictl FAIL"
+
+۳.۵ — کانفیگ containerd برای private registry
+bash
+
+# روی هر نود — حذف تصویر sandbox از registry عمومی و استفاده از local:
+grep -q "SystemdCgroup = true" /etc/containerd/config.toml && \
+  echo "✅ SystemdCgroup already set" || \
+  sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+# ⚠️ مهم: pause image را به registry local تغییر بده
+sed -i 's|sandbox_image = ".*"|sandbox_image = "registry.local/k8s/pause:3.10"|' /etc/containerd/config.toml
+
+# اضافه کردن config.d برای registry.local (HTTP نه HTTPS):
+mkdir -p /etc/containerd/certs.d/registry.local
+cat > /etc/containerd/certs.d/registry.local/hosts.toml <<EOF
+server = "http://registry.local"
+
+[host."http://registry.local"]
+  capabilities = ["pull", "resolve", "push"]
+  skip_verify = true
+EOF
+
+# فعال‌سازی config_path
+grep -q 'config_path = "/etc/containerd/certs.d"' /etc/containerd/config.toml || \
+  sed -i 's|\[plugins."io.containerd.grpc.v1.cri".registry\]|[plugins."io.containerd.grpc.v1.cri".registry]\n    config_path = "/etc/containerd/certs.d"|' /etc/containerd/config.toml
+
+# ✅ چک:
+grep -E "SystemdCgroup|sandbox_image|config_path" /etc/containerd/config.toml
+# انتظار:
+#   SystemdCgroup = true
+#   sandbox_image = "registry.local/k8s/pause:3.10"
+#   config_path = "/etc/containerd/certs.d"
+
+systemctl restart containerd
+systemctl is-active containerd
+# انتظار: active
+
+# تست pull از registry local:
+crictl pull registry.local/k8s/pause:3.10
+# انتظار: Image is up to date for sha256:...
+
+۳.۶ — نصب kubeadm/kubelet/kubectl
+bash
+
+cd /opt/k8s-bundle/deb
+
+apt-get install -y --no-download --fix-missing \
+  ./kubeadm_*.deb ./kubelet_*.deb ./kubectl_*.deb
+
+# hold
+apt-mark hold kubelet kubeadm kubectl
+
+# ✅ چک:
+kubeadm version -o short 2>&1 | grep -q "v1.31.2" && echo "✅ kubeadm OK" || echo "❌"
+kubelet --version 2>&1 | grep -q "v1.31.2" && echo "✅ kubelet OK" || echo "❌"
+kubectl version --client -o yaml 2>&1 | grep -q "gitVersion: v1.31.2" && echo "✅ kubectl OK" || echo "❌"
+
+systemctl enable kubelet
+# ⚠️ start نکن — kubeadm init می‌کند
+
+۳.۷ — Pre-pull image ها از registry local
+bash
+
+# لیست image ها باید با kubeadm config images list متفاوت باشد (registry.local):
+cat > /tmp/local-images.txt <<EOF
+registry.local/k8s/kube-apiserver:v1.31.2
+registry.local/k8s/kube-controller-manager:v1.31.2
+registry.local/k8s/kube-scheduler:v1.31.2
+registry.local/k8s/kube-proxy:v1.31.2
+registry.local/k8s/pause:3.10
+registry.local/k8s/etcd:3.5.15-0
+registry.local/k8s/coredns:v1.11.1
+EOF
+
+while IFS= read -r img; do
+  crictl pull "$img" || echo "❌ $img"
+done < /tmp/local-images.txt
+
+# ✅ چک:
+crictl images | grep registry.local/k8s | wc -l
+# انتظار: 7
+
+🎛️ فاز ۴: kubeadm init در محیط ایزوله
+۴.۱ — کانفیگ kubeadm با registry محلی
+bash
+
+cat > /etc/kubernetes/kubeadm-config.yaml <<'EOF'
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: 10.0.0.10
+  bindPort: 6443
+nodeRegistration:
+  name: master1
+  criSocket: unix:///run/containerd/containerd.sock
+bootstrapTokens:
+  - groups: [system:bootstrappers:kubeadm:default-node-token]
+    token: "abcdef.0123456789abcdef"
+    ttl: 24h0m0s
+    usages: [signing, authentication]
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v1.31.2
+clusterName: k8s-prod
+controlPlaneEndpoint: "k8s-api:6443"
+# ❗ مهم‌ترین بخش برای air-gapped:
+imageRepository: registry.local/k8s
+networking:
+  serviceSubnet: "10.96.0.0/12"
+  podSubnet: "10.244.0.0/16"
+  dnsDomain: "cluster.local"
+apiServer:
+  certSANs:
+    - "k8s-api"
+    - "10.0.0.100"
+    - "master1"
+    - "10.0.0.10"
+    - "master2"
+    - "10.0.0.11"
+    - "master3"
+    - "10.0.0.12"
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+authentication:
+  anonymous:
+    enabled: false
+  webhook:
+    enabled: true
+  x509:
+    clientCAFile: /etc/kubernetes/pki/ca.crt
+authorization:
+  mode: Webhook
+rotateCertificates: true
+serverTLSBootstrap: true
+EOF
+
+# ✅ چک: imageRepository درست است؟
+grep "imageRepository" /etc/kubernetes/kubeadm-config.yaml
+# انتظار: imageRepository: registry.local/k8s
+
+۴.۲ — Dry-run و چک image ها
+bash
+
+# چک image ها با config:
+kubeadm config images list --config=/etc/kubernetes/kubeadm-config.yaml
+
+# انتظار (باید از registry.local باشد):
+#   registry.local/k8s/kube-apiserver:v1.31.2
+#   registry.local/k8s/kube-controller-manager:v1.31.2
+#   registry.local/k8s/kube-scheduler:v1.31.2
+#   registry.local/k8s/kube-proxy:v1.31.2
+#   registry.local/k8s/pause:3.10
+#   registry.local/k8s/etcd:3.5.15-0
+#   registry.local/k8s/coredns:v1.11.1
+
+# فیلتر: هیچ image از registry.k8s.io نباید باقی بماند:
+kubeadm config images list --config=/etc/kubernetes/kubeadm-config.yaml 2>/dev/null | \
+  grep "registry.k8s.io" && echo "❌ STILL USING UPSTREAM" || echo "✅ ALL LOCAL"
+# انتظار: ✅ ALL LOCAL
+
+# dry-run init:
+kubeadm init --config=/etc/kubernetes/kubeadm-config.yaml --dry-run 2>&1 | \
+  grep -E "WARN|ERROR|pull" | head -10
+# انتظار: هیچ ERROR (warning درباره HA ok است)
+
+۴.۳ — Init واقعی
+bash
+
+kubeadm init --config=/etc/kubernetes/kubeadm-config.yaml --upload-certs 2>&1 | \
+  tee /root/kubeadm-init-airgapped.log
+
+# ✅ چک در لاگ:
+grep -E "ERROR|failed" /root/kubeadm-init-airgapped.log
+# انتظار: هیچ خروجی
+
+grep "Your Kubernetes control-plane has initialized" /root/kubeadm-init-airgapped.log
+# انتظار: همان خط
+
+# کپی kubeconfig:
+mkdir -p $HOME/.kube
+cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+chown $(id -u):$(id -g) $HOME/.kube/config
+chmod 600 $HOME/.kube/config
+
+# چک:
+kubectl get nodes
+# انتظار: master1   NotReady   control-plane
+
+kubectl get pods -n kube-system
+# انتظار: kube-apiserver/etcd/scheduler/controller-manager = Running
+#         coredns = Pending
+#         kube-proxy = Running
+
+# بررسی اینکه همه image ها از registry.local است:
+kubectl get pods -n kube-system -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | \
+  grep "registry.k8s.io" && echo "❌ STILL UPSTREAM" || echo "✅ ALL FROM registry.local"
+
+۴.۴ — نصب Calico از bundle محلی
+bash
+
+cd /opt/k8s-bundle/manifests
+
+# آپدیت manifest برای استفاده از registry.local
+# ابتدا ببینیم چه image هایی نیاز دارد:
+grep "image:" tigera-operator.yaml | sort -u
+
+# retag در manifest — قبل از اعمال:
+sed -i 's|quay.io/tigera/operator:.*|registry.local/k8s/tigera-operator:v1.34.1|' tigera-operator.yaml
+
+# custom-resources: هم podSubnet را چک کن:
+grep -A1 "cidr:" custom-resources.yaml
+# اگر 192.168.0.0/16 بود و kubeadm بالا 10.244.0.0/16:
+sed -i 's|192.168.0.0/16|10.244.0.0/16|g' custom-resources.yaml
+
+# اعمال:
+kubectl create -f tigera-operator.yaml
+kubectl -n tigera-operator wait --for=condition=Available deploy/tigera-operator --timeout=5m
+
+# ❗ Calico image ها در operator CR می‌آیند — قبل از apply، image path را چک کن:
+sed -i 's|quay.io/|registry.local/k8s/|g' custom-resources.yaml
+
+kubectl create -f custom-resources.yaml
+
+# نظارت:
+kubectl -n calico-system get pods -w
+# Ctrl+C وقتی همه Running شدند
+
+۴.۵ — Join master2/3 و workerها
+bash
+
+# از لاگ init:
+TOKEN=$(grep "kubeadm join" /root/kubeadm-init-airgapped.log | head -1 | awk '{print $5}')
+HASH=$(grep -oE "sha256:[a-f0-9]+" /root/kubeadm-init-airgapped.log | head -1)
+CERT_KEY=$(grep -oE "\-\-certificate-key [a-f0-9]+" /root/kubeadm-init-airgapped.log | awk '{print $2}')
+
+echo "Token: $TOKEN"
+echo "Hash:  $HASH"
+echo "Cert:  $CERT_KEY"
+
+# روی master2/3:
+kubeadm join k8s-api:6443 --token "$TOKEN" \
+  --discovery-token-ca-cert-hash "$HASH" \
+  --control-plane --certificate-key "$CERT_KEY" \
+  --apiserver-advertise-address=10.0.0.11 \
+  --node-name=master2
+
+# روی worker1/2:
+kubeadm join k8s-api:6443 --token "$TOKEN" \
+  --discovery-token-ca-cert-hash "$HASH"
+
+۴.۶ — چک نهایی Air-Gapped
+bash
+
+# ۱. همه نودها Ready؟
+kubectl get nodes | grep -v "Ready" | grep -v "NAME" && echo "❌" || echo "✅ ALL READY"
+
+# ۲. هیچ image از اینترنت؟
+kubectl get pods -A -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' | \
+  grep -vE "^registry.local/" && echo "❌ EXTERNAL IMAGE FOUND" || echo "✅ ALL LOCAL"
+# انتظار: ✅ ALL LOCAL
+
+# ۳. هیچ container از registry.k8s.io pull نشده؟
+crictl images | grep -E "registry.k8s.io|quay.io|docker.io" && \
+  echo "❌ EXTERNAL IMAGES IN CACHE" || echo "✅ NO EXTERNAL"
+# انتظار: ✅ NO EXTERNAL
+
+# ۴. DNS کار می‌کند؟
+kubectl run dns-test --rm -it --image=registry.local/k8s/busybox:1.36 \
+  --restart=Never -- nslookup kubernetes.default 2>&1 | grep -q "Address:" && \
+  echo "✅ DNS OK" || echo "❌ DNS FAIL"
+
+# ۵. Test workload:
+kubectl create deploy test --image=registry.local/k8s/nginx:alpine --replicas=2
+kubectl rollout status deploy test --timeout=60s
+kubectl delete deploy test
+
+🎯 چک‌لیست Air-Gapped Complete:
+چک	دستور	انتظار
+Bundle checksum	sha256sum -c SHA256SUMS	همه OK
+Harbor healthy	curl registry.local/api/v2.0/health	healthy
+Images in registry	curl .../projects/k8s/repositories	همه image ها
+containerd config	grep sandbox_image config.toml	registry.local/...
+kubeadm config	grep imageRepository	registry.local/k8s
+Pre-pull	crictl images | grep registry.local	≥ 7
+Init log	grep ERROR init.log	خالی
+Pod images	kubectl get pods -A -o jsonpath	همه registry.local/
+No external	grep -vE "registry.local"	خالی
+⬆️ بخش ۲: ارتقا به نسخه جدید (Upgrade)
+
+    سناریو: v1.31.2 → v1.32.x روی کلاستر HA با ۳ master و ۲ worker.
+
+📐 قوانین Version Skew (حیاتی)
+مؤلفه	اختلاف مجاز
+kubelet vs kube-apiserver	kubelet می‌تواند ۲ minor عقب‌تر باشد
+kube-proxy vs kubelet	همان نسخه
+kubectl vs kube-apiserver	±1 minor
+kube-controller-manager/scheduler vs apiserver	همان نسخه
+
+قانون طلایی: همیشه minor به minor ارتقا بده (1.31 → 1.32، نه 1.31 → 1.33). برای پریدن چند نسخه، مرحله به مرحله.
+🚦 فاز ۱: Pre-Upgrade Checklist
+۱.۱ — چک نسخه فعلی
+bash
+
+kubectl version -o yaml | grep -E "gitVersion|major|minor"
+# انتظار: gitVersion: v1.31.2
+
+kubeadm version -o short
+# انتظار: v1.31.2
+
+kubectl get nodes -o wide
+# انتظار: همه Ready, همه v1.31.2
+
+۱.۲ — بررسی نسخه هدف در repo محلی
+bash
+
+# روی bastion اینترنتی — دانلود v1.32 bundle (همان بخش ۱ برای نسخه جدید)
+# سپس منتقل به bastion-local و push به Harbor
+
+# روی bastion-local — چک نسخه‌های موجود در registry:
+curl -s -u admin:'Harbor12345!' \
+  "http://registry.local/api/v2.0/projects/k8s/repositories/kube-apiserver/artifacts?page_size=100" | \
+  jq -r '.[].tags[].name' | sort
+# انتظار: v1.31.2, v1.32.0, ...
+
+# روی هر master — چک apt repo محلی:
+apt-cache madison kubeadm 2>/dev/null || \
+  ls /opt/k8s-bundle-v1.32/deb/kubeadm_*.deb
+# انتظار: kubeadm_1.32.0-1.1_amd64.deb
+
+۱.۳ — Backup etcd (اجباری!)
+bash
+
+# روی master1 — در مسیر امن:
+ETCDCTL_API=3 etcdctl snapshot save \
+  /backup/etcd-pre-upgrade-$(date +%Y%m%d-%H%M%S).db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# ✅ چک:
+LATEST=$(ls -t /backup/etcd-pre-upgrade-*.db | head -1)
+echo "Backup: $LATEST"
+ETCDCTL_API=3 etcdctl snapshot status "$LATEST" -w table
+# انتظار: جدول با HASH, REVISION, TOTAL KEYS, TOTAL SIZE — نه "not a valid snapshot"
+
+# چک: kubeconfig و pki هم بکاپ بگیر:
+tar czf /backup/etc-kubernetes-$(date +%F).tgz /etc/kubernetes/
+ls -lh /backup/etcd-pre-upgrade-*.db /backup/etc-kubernetes-*.tgz
+
+۱.۴ — چک سلامت پیش از upgrade
+bash
+
+# ۱. همه نودها Ready؟
+kubectl get nodes | awk 'NR>1 && $2!="Ready"{print "❌ "$1"="$2}' || echo "✅ ALL READY"
+
+# ۲. کنترل‌پلین سالم؟
+kubectl -n kube-system get pods | grep -E "etcd|apiserver|controller|scheduler" | \
+  awk '$3!="Running"{print "❌ "$1"="$3}' || echo "✅ CONTROL PLANE OK"
+
+# ۳. readyz:
+kubectl get --raw='/readyz?verbose' | tail -1
+# انتظار: readyz check passed
+
+# ۴. cert ها منقضی نیستند؟
+kubeadm certs check-expiration | grep -E "EXPIRED|RESIDUAL" | head -5
+# اگر RESIDUAL TIME < 6 ماه → قبل از upgrade renew کن
+kubeadm certs check-expiration | grep -c "RESIDUAL TIME: [1-9]" 
+# انتظار: تعداد ≈ 10
+
+# ۵. API latency:
+time kubectl get --raw=/healthz
+# انتظار: < 500ms
+
+# ۶. Disk space کافی:
+df -h / /var/lib/etcd /var/lib/containerd | awk 'NR>1 && $5+0>70{print "❌ "$6"="$5}' || echo "✅ DISK OK"
+
+۱.۵ — چک API های Deprecated
+bash
+
+# قبل از upgrade، API های deprecated/removed را شناسایی کن
+# اگر kubectl-convert نداری، از bundle نصب کن:
+ls /opt/k8s-bundle/bin/kubectl-convert* 2>/dev/null || \
+  echo "⚠️ kubectl-convert not found — manual review needed"
+
+# چک دستی: منابع deprecated در v1.32
+kubectl get deployments,statefulsets,daemonsets,replicasets -A -o json | \
+  jq -r '.items[] | select(.apiVersion != "apps/v1") | "❌ \(.kind)/\(.metadata.name) uses \(.apiVersion)"'
+# انتظار: هیچ خروجی
+
+kubectl get ingress -A -o json | \
+  jq -r '.items[] | select(.apiVersion == "extensions/v1beta1" or .apiVersion == "networking.k8s.io/v1beta1") | "❌ \(.metadata.name)"'
+# انتظار: هیچ خروجی
+
+# چک PodSecurityPolicy (حذف شده در 1.25):
+kubectl get psp 2>&1 | grep -q "not found" && echo "✅ PSP removed" || echo "⚠️ PSP still present"
+
+# چک webhook ها:
+kubectl get validatingwebhookconfigurations -o json | \
+  jq -r '.items[] | select(.webhooks[].admissionReviewVersions[]? == "v1beta1") | .metadata.name'
+# انتظار: هیچ خروجی — همه باید v1 باشند
+
+۱.۶ — اطلاع‌رسانی و برنامه‌ریزی
+bash
+
+# در #k8s-ops بنویس:
+# "Upgrade v1.31.2 → v1.32.0 starting in 10 min. Master upgrade first (~15 min),
+#  then workers (~10 min each). No API downtime expected (HA)."
+
+# اگر PDB فعال داری، چک کن:
+kubectl get pdb -A
+# انتظار: همه ALLOWED DISRUPTIONS > 0
+
+🎛️ فاز ۲: ارتقا Control Plane
+۲.۱ — Upgrade اولین master (master1)
+bash
+
+# ۱. نصب kubeadm نسخه جدید از bundle:
+cd /opt/k8s-bundle-v1.32/deb
+apt-get install -y --no-install-recommends --allow-change-held-packages \
+  ./kubeadm_1.32.0-1.1_amd64.deb
+
+# ✅ چک:
+kubeadm version -o short | grep "v1.32.0" && echo "✅ kubeadm v1.32" || echo "❌"
+# ⚠️ kubelet هنوز v1.31 است — طبیعی
+
+# ۲. بررسی upgrade plan:
+kubeadm upgrade plan
+# خروجی باید نشان دهد:
+#   [UPGRADE/EXPERIMENTAL] Upgrade to the latest version in the v1.31 series (اگر minor patch)
+#   [UPGRADE] Upgrade to v1.32.0
+#   External components that should be upgraded manually...
+
+⚠️ چک مهم: در خروجی kubeadm upgrade plan، بخش ADDITIONAL PATH COMPONENTS را ببین. اگر CoreDNS یا kube-proxy جدید لازم است، دستی upgrade کن:
+bash
+
+# اگر version کافی نیست:
+kubeadm upgrade plan 2>&1 | grep -A3 "Components that must be upgraded manually"
+
+۲.۲ — اعمال upgrade روی master1
+bash
+
+# پارامتر `apply` — نسخه را صریح بده:
+kubeadm upgrade apply v1.32.0 --yes 2>&1 | tee /root/upgrade-master1.log
+
+# ✅ چک‌ها:
+grep -E "ERROR|failed|FAIL" /root/upgrade-master1.log && echo "❌ FAIL" || echo "✅ OK"
+
+grep -q "SUCCESS! Your cluster was upgraded to \"v1.32.0\"" /root/upgrade-master1.log && \
+  echo "✅ UPGRADE SUCCESS" || echo "❌ CHECK LOG"
+
+خروجی موفق:
+text
+
+[upgrade/staticpods] Moved new manifest to "/etc/kubernetes/manifests/etcd.yaml"
+[upgrade/staticpods] Waiting for the kubelet to restart the component
+[upgrade/successful] SUCCESS! Your cluster was upgraded to "v1.32.0". Enjoy!
+[upgrade/kubelet] Now that your control plane components are upgraded and restarted,
+you'll need to upgrade kubelet and kubectl on all control plane nodes
+
+۲.۳ — Upgrade kubelet و kubectl روی master1
+bash
+
+# تخلیه نود (cordon + drain):
+kubectl drain master1 --ignore-daemonsets --delete-emptydir-data --force
+
+# ✅ چک:
+kubectl get nodes | grep master1 | grep -q "SchedulingDisabled" && \
+  echo "✅ CORDONED" || echo "❌"
+
+# نصب kubelet/kubectl جدید:
+apt-get install -y --allow-change-held-packages \
+  ./kubelet_1.32.0-1.1_amd64.deb ./kubectl_1.32.0-1.1_amd64.deb
+
+# ✅ چک:
+kubelet --version | grep "v1.32.0" && echo "✅ kubelet v1.32" || echo "❌"
+kubectl version --client -o yaml | grep "gitVersion: v1.32.0" && echo "✅ kubectl" || echo "❌"
+
+# reload و restart:
+systemctl daemon-reload
+systemctl restart kubelet
+
+# ✅ چک:
+systemctl is-active kubelet && echo "✅ kubelet active" || echo "❌ kubelet DOWN"
+journalctl -u kubelet -n 20 --no-pager | grep -iE "error|fail" && echo "❌ ERRORS" || echo "✅ NO ERRORS"
+
+# نود رو برگردون:
+kubectl uncordon master1
+
+# ✅ چک Ready:
+kubectl get node master1 | grep -q " Ready " && echo "✅ READY" || echo "❌ NOT READY"
+
+# چک نسخه نود:
+kubectl get nodes -o wide | grep master1
+# انتظار: master1  Ready  control-plane  v1.32.0
+
+۲.۴ — Upgrade master2 و master3 (ترتیبی)
+
+قانون: هرگز دو master را همزمان upgrade نکن. quorum را از دست می‌دهی.
+bash
+
+# روی master2:
+cd /opt/k8s-bundle-v1.32/deb
+apt-get install -y --no-install-recommends --allow-change-held-packages ./kubeadm_1.32.0-1.1_amd64.deb
+
+# ⚠️ فقط `upgrade node` نه `apply` — master1 قبلاً etcd را ارتقا داده
+kubeadm upgrade node 2>&1 | tee /root/upgrade-master2.log
+grep -q "SUCCESS" /root/upgrade-master2.log && echo "✅" || echo "❌"
+
+# روی master1 — drain:
+kubectl drain master2 --ignore-daemonsets --delete-emptydir-data --force
+
+# روی master2 — install kubelet/kubectl:
+apt-get install -y --allow-change-held-packages \
+  ./kubelet_1.32.0-1.1_amd64.deb ./kubectl_1.32.0-1.1_amd64.deb
+systemctl daemon-reload && systemctl restart kubelet
+
+# روی master1 — uncordon:
+kubectl uncordon master2
+
+# ✅ چک:
+kubectl get nodes | grep master2
+# انتظار: master2  Ready  control-plane  v1.32.0
+
+# تکرار دقیق برای master3
+
+۲.۵ — چک پس از upgrade Control Plane
+bash
+
+# ۱. همه master ها v1.32:
+kubectl get nodes -o wide | grep control-plane | grep -v "v1.32.0" && \
+  echo "❌ MIXED VERSIONS" || echo "✅ ALL CONTROL PLANE v1.32"
+
+# ۲. static pods درست:
+kubectl get pods -n kube-system -l tier=control-plane -o wide | \
+  awk 'NR>1 && $3!="Running"{print "❌ "$1"="$3}' || echo "✅ CONTROL PLANE PODS OK"
+
+# ۳. image نسخه جدید؟
+kubectl get pods -n kube-system -l component=kube-apiserver \
+  -o jsonpath='{.items[0].spec.containers[0].image}'
+# انتظار: registry.local/k8s/kube-apiserver:v1.32.0
+
+# ۴. etcd healthy:
+kubectl -n kube-system exec etcd-master1 -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint health --cluster
+# انتظار: هر ۳ عضو "is healthy"
+
+# ۵. readyz:
+kubectl get --raw='/readyz?verbose' | tail -1
+# انتظار: readyz check passed
+
+۲.۶ — Upgrade Addons (CoreDNS, kube-proxy)
+bash
+
+# kube-proxy خودکار با kubeadm upgrade apply ارتقا می‌یابد، اما چک کن:
+kubectl -n kube-system get ds kube-proxy -o jsonpath='{.spec.template.spec.containers[0].image}'
+# انتظار: registry.local/k8s/kube-proxy:v1.32.0
+
+# اگر قدیمی بود (از kubeadm apply رد شده):
+kubectl -n kube-system set image ds/kube-proxy \
+  kube-proxy=registry.local/k8s/kube-proxy:v1.32.0
+
+kubectl -n kube-system rollout status ds/kube-proxy
+
+# CoreDNS معمولاً دستی:
+kubeadm upgrade plan 2>&1 | grep -A5 "CoreDNS"
+# اگر نسخه جدید لازم بود:
+kubectl -n kube-system set image deploy/coredns \
+  coredns=registry.local/k8s/coredns:v1.11.3
+kubectl -n kube-system rollout status deploy/coredns
+
+# ✅ چک:
+kubectl -n kube-system get deploy coredns -o jsonpath='{.spec.template.spec.containers[0].image}'
+
+🖥️ فاز ۳: ارتقا Worker Nodes
+
+    قانون مهم: worker ها می‌توانند تا ۲ minor عقب‌تر از apiserver باشند. پس بعد از control plane upgrade، worker ها فوراً نمی‌شکنند. اما بهتر است در همان maintenance window upgrade شوند.
+
+۳.۱ — Worker1 (اولین worker برای canary)
+bash
+
+# روی worker1 — نصب kubeadm جدید:
+cd /opt/k8s-bundle-v1.32/deb
+apt-get install -y --no-install-recommends --allow-change-held-packages ./kubeadm_1.32.0-1.1_amd64.deb
+
+kubeadm version -o short | grep "v1.32.0" && echo "✅ kubeadm OK" || echo "❌"
+
+# ⚠️ از master1 — drain:
+kubectl drain worker1 --ignore-daemonsets --delete-emptydir-data
+
+# ✅ چک:
+kubectl get nodes | grep worker1 | grep -q "SchedulingDisabled" && \
+  echo "✅ DRAINED" || echo "❌ NOT DRAINED"
+
+# چک: پادهای حیاتی روی worker1 تخلیه شدند؟
+kubectl get pods -A -o wide --field-selector spec.nodeName=worker1 | \
+  grep -vE "kube-system|calico-system|Completed" | wc -l
+# انتظار: 0 (هیچ workload کاربر)
+
+# روی worker1 — upgrade kubelet config:
+kubeadm upgrade node 2>&1 | tee /root/upgrade-worker1.log
+grep -q "SUCCESS" /root/upgrade-worker1.log && echo "✅ OK" || echo "❌ FAIL"
+
+# نصب kubelet/kubectl جدید:
+apt-get install -y --allow-change-held-packages \
+  ./kubelet_1.32.0-1.1_amd64.deb ./kubectl_1.32.0-1.1_amd64.deb
+
+# ✅ چک:
+kubelet --version | grep "v1.32.0"
+
+systemctl daemon-reload && systemctl restart kubelet
+systemctl is-active kubelet && echo "✅ active" || echo "❌ DOWN"
+journalctl -u kubelet -n 15 --no-pager | grep -iE "error|fail" && echo "❌" || echo "✅ NO ERR"
+
+# از master1 — uncordon:
+kubectl uncordon worker1
+
+# ✅ چک Ready:
+kubectl get nodes | grep worker1
+# انتظار: worker1  Ready  <none>  v1.32.0
+
+# تست workload روی worker1:
+kubectl run test-w1 --image=registry.local/k8s/nginx:alpine \
+  --overrides='{"spec":{"nodeName":"worker1"}}' --restart=Never
+kubectl wait --for=condition=Ready pod/test-w1 --timeout=60s && \
+  echo "✅ WORKER1 HEALTHY" || echo "❌ FAIL"
+kubectl delete pod test-w1
+
+۳.۲ — Worker2 (پس از موفقیت worker1)
+bash
+
+# دقیقاً همان مراحل روی worker2
+# هیچ تفاوتی ندارد
+
+✅ فاز ۴: چک نهایی Upgrade
+۴.۱ — چک نسخه‌ها
+bash
+
+# همه نودها v1.32؟
+kubectl get nodes -o wide
+# انتظار: همه v1.32.0
+
+kubectl get nodes -o json | jq -r '.items[] | "\(.metadata.name): \(.status.nodeInfo.kubeletVersion)"'
+# همه باید kubeletVersion: v1.32.0 باشد
+
+# کدامیک قدیمی مانده؟
+kubectl get nodes -o json | jq -r '.items[] | select(.status.nodeInfo.kubeletVersion != "v1.32.0") | .metadata.name'
+# انتظار: خالی
+
+۴.۲ — چک سلامت کامل
+bash
+
+# ۱. همه podها سالم؟
+kubectl get pods -A --no-headers | \
+  awk '$4!="Running" && $4!="Completed"{print "❌ "$1"/"$2"="$4}' | head -10 || echo "✅ ALL PODS"
+
+# ۲. API latency:
+time kubectl get --raw=/healthz
+# < 500ms
+
+# ۳. readyz:
+kubectl get --raw='/readyz?verbose' | tail -1
+
+# ۴. etcd:
+kubectl -n kube-system exec etcd-master1 -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint health --cluster
+
+# ۵. آپ‌تایم پادهای kube-system (همه restart شدند):
+kubectl -n kube-system get pods -o wide | grep -v Running | grep -v Completed
+# انتظار: خالی
+
+# ۶. version skew:
+kubectl version -o json | jq -r '"client: \(.clientVersion.gitVersion)  server: \(.serverVersion.gitVersion)"'
+# انتظار: client: v1.32.0  server: v1.32.0
+
+# ۷. rolling update جدید کار می‌کند؟
+kubectl create deploy smoke-test --image=registry.local/k8s/nginx:alpine --replicas=2
+kubectl rollout status deploy/smoke-test --timeout=60s && echo "✅ ROLLOUT OK"
+kubectl delete deploy smoke-test
+
+۴.۳ — چک API های جدید
+bash
+
+# ۱. API های جدید v1.32 فعال هستند؟
+kubectl api-resources | grep -E "v1alpha|v1beta" | grep "1.32" || \
+  echo "ℹ️ no new alpha/beta in 1.32"
+
+# ۲. resources قدیمی هنوز کار می‌کنند؟
+kubectl get deploy,sts,ds -A --no-headers | wc -l
+# باید همان تعداد قبل از upgrade باشد
+
+# ۳. webhook ها پاسخگو هستند؟
+kubectl create ns webhook-test --dry-run=server -o yaml 2>&1 | \
+  grep -q "webhook" && echo "❌ WEBHOOK FAIL" || echo "✅ WEBHOOKS OK"
+
+۴.۴ — چک عملکرد (Performance)
+bash
+
+# ۱. latency API از هر master:
+for m in master1 master2 master3; do
+  ssh $m 'time kubectl get --raw=/healthz' 2>&1 | grep real
+done
+
+# ۲. etcd fsync latency (باید < 25ms باشد):
+kubectl -n kube-system exec etcd-master1 -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint status -w table
+# ستون DB SIZE نباید ناگهانی بزرگ شده باشد
+
+# ۳. pod startup:
+time kubectl run perf --image=registry.local/k8s/pause:3.10 --restart=Never
+kubectl wait --for=condition=Ready pod/perf --timeout=30s
+kubectl delete pod perf
+# < 15s
+
+🔙 فاز ۵: Rollback (اگر مشکل بود)
+۵.۱ — سناریو: upgrade master1 شکست خورده
+bash
+
+# ۱. اگر kubeadm upgrade apply خطا داد (نه warning):
+# گزینه‌ها:
+#   a) رفع مشکل و دوباره apply
+#   b) rollback از backup
+
+# ۲. rollback از etcd snapshot (فقط در صورت خرابی جدی):
+ssh master1
+systemctl stop kubelet
+# حذف data قدیمی:
+mv /var/lib/etcd /var/lib/etcd.broken
+mkdir -p /var/lib/etcd
+
+# restore:
+ETCDCTL_API=3 etcdctl snapshot restore \
+  /backup/etcd-pre-upgrade-YYYYMMDD-HHMMSS.db \
+  --data-dir=/var/lib/etcd \
+  --name=master1 \
+  --initial-cluster=master1=https://10.0.0.10:2380,master2=https://10.0.0.11:2380,master3=https://10.0.0.12:2380 \
+  --initial-advertise-peer-urls=https://10.0.0.10:2380
+
+# بازگرداندن static pod قدیمی:
+ls /etc/kubernetes/manifests/
+# اگر kubeadm upgrade apply جدید کرده، etcd.yaml قدیمی را از backup برگردان
+
+# چک:
+systemctl start kubelet
+sleep 30
+kubectl get nodes
+kubectl version -o short
+
+۵.۲ — سناریو: worker در loop CrashLoop بعد از upgrade
+bash
+
+# روی worker مشکل‌دار:
+journalctl -u kubelet -n 100 --no-pager | grep -E "error|fail|panic" | head -20
+
+# علت رایج: cgroup driver mismatch
+grep cgroupDriver /var/lib/kubelet/config.yaml
+# انتظار: systemd
+grep SystemdCgroup /etc/containerd/config.toml
+# انتظار: true
+
+# اگر mismatch بود:
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+systemctl restart containerd kubelet
+
+# اگر همچنان مشکل:
+# rollback kubelet به نسخه قبلی:
+apt-get install -y --allow-downgrades --allow-change-held-packages \
+  ./kubelet_1.31.2-1.1_amd64.deb ./kubectl_1.31.2-1.1_amd64.deb
+systemctl daemon-reload && systemctl restart kubelet
+
+⚠️ هشدار: rollback از v1.32 به v1.31 در kubeadm پشتیبانی نمی‌شود اگر kubeadm upgrade apply قبلاً اجرا شده باشد. تنها راه rollback واقعی، restore از etcd snapshot است. به همین دلیل backup قبل از upgrade اجباری است.
+📊 چک‌لیست کامل Upgrade
+مرحله	دستور	انتظار
+Backup etcd	etcdctl snapshot status <file>	valid
+Node Ready	kubectl get nodes | grep -v Ready	خالی
+Deprecated API	jq '.items[] | select(.apiVersion != "apps/v1")'	خالی
+kubeadm new	kubeadm version -o short	v1.32.0
+Upgrade plan	kubeadm upgrade plan	بدون ERROR
+Apply master1	grep "SUCCESS" upgrade.log	✓
+kubelet master1	kubelet --version	v1.32.0
+Uncordon master1	kubectl get nodes | grep master1	Ready
+readyz	kubectl get --raw=/readyz	ok
+etcd health	etcdctl endpoint health --cluster	healthy × 3
+kube-proxy image	kubectl get ds -o jsonpath	v1.32.0
+CoreDNS image	kubectl get deploy coredns -o jsonpath	v1.11.3
+Worker drain	kubectl get nodes | grep worker1	SchedulingDisabled
+Worker upgraded	kubectl get nodes | grep worker1	v1.32.0 Ready
+All pods	kubectl get pods -A --no-headers | awk '$4!="Running"'	خالی
+Rollout test	kubectl rollout status deploy/test	successfully
+API latency	time kubectl get --raw=/healthz	< 500ms
+🎯 Best Practices عملیاتی
+Air-Gapped
+
+    همیشه SHA256SUMS بگیر و verify کن — یک USB آلوده، کل کلاستر را آلوده می‌کند.
+
+    Harbor با Trivy — قبل از push به registry، image ها را scan کن (trivy image --severity HIGH,CRITICAL).
+
+    Harbor در HA — در production، Harbor را با external PostgreSQL + S3/MinIO راه‌اندازی کن، نه embedded.
+
+    تصویر pause را با crictl pull قبل از kubeadm init تست کن — این اولین چیزی است که kubelet pull می‌کند.
+
+    tag تمام image ها را pin کن — :latest در air-gap ممنوع.
+
+    نسخه‌بندی bundle — k8s-bundle-v1.31.2.tar.gz + SHA + CHANGELOG.
+
+Upgrade
+
+    هرگز skip minor — 1.31 → 1.32 → 1.33 نه 1.31 → 1.33.
+
+    Backup etcd اجباری — بدون آن، rollback ممکن نیست.
+
+    اول master بعد worker — worker تا ۲ minor می‌تواند عقب باشد.
+
+    drain قبل از kubelet upgrade — پادها با نسخه kubelet جدید rebuild می‌شوند.
+
+    PDB فعال داشته باش — drain روی workloadهای حساس بدون PDB باعث downtime می‌شود.
+
+    maintenance window — حتی با HA، در ساعات کم‌ترافیک.
+
+    upgrade در staging اول — همان نسخه، همان manifest.
+
+    cordon/uncordon سریع — بین drain و uncordon بیش از ۵ دقیقه فاصله نباشد.
+
+    monitor در حین upgrade — kubectl get events -w و kubectl get pods -A -w در کنار.
+
+    CHANGELOG بخوان — Kubernetes release notes برای breaking changes.
+
+چک‌های همیشگی (بعد از هر upgrade)
+bash
+
+# اسکریپت جامع که در پیام قبلی نوشتیم:
+/root/k8s-health-check.sh
+
+# و exporter:
+curl -s localhost:9876/metrics | grep -E "node_ready|kubelet_active|api_latency"
+
+📎 مسیرهای دانلود Air-Gapped
+مورد	لینک
+Kubernetes .deb	https://pkgs.k8s.io/core:/stable:/v1.32/deb/
+containerd.io	https://download.docker.com/linux/ubuntu/dists/jammy/pool/stable/amd64/
+runc	https://github.com/opencontainers/runc/releases
+CNI plugins	https://github.com/containernetworking/plugins/releases
+crictl	https://github.com/kubernetes-sigs/cri-tools/releases
+Harbor	https://github.com/goharbor/harbor/releases (offline installer)
+Calico manifests	https://github.com/projectcalico/calico/releases
+etcdctl	https://github.com/etcd-io/etcd/releases
+helm	https://get.helm.sh/
+
+    🎯 خلاصه: Air-gapped = bundle کامل + Harbor + imageRepository در kubeadm. Upgrade = backup + kubeadm upgrade plan/apply + drain/kubelet/uncordon. هر دو با verify در هر مرحله (grep + expected output).
+

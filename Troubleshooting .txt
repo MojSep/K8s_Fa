@@ -1,0 +1,1217 @@
+﻿🚨 راهنمای جامع Troubleshooting عملیاتی Kubernetes
+
+    آنچه یک DevOps Engineer در محیط production واقعاً انجام می‌دهد: از لحظه‌ی دریافت alert تا post-mortem.
+
+🎯 بخش ۱: مدل ذهنی و Workflow
+۱.۱ — Incident Response Lifecycle
+text
+
+Alert / Page
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ 1. TRIAGE (۲ دقیقه)                                     │
+│   - Severity? (SEV1=prod down, SEV2=degraded, SEV3=warn)│
+│   - Scope? (1 pod / 1 node / 1 zone / whole cluster)    │
+│   - Impact? (users / revenue / SLA)                     │
+│   - Recent changes? (deploy, config, infra)             │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ 2. MITIGATE (اولویت!)                                   │
+│   - Rollback (اگر deploy بود)                           │
+│   - Scale up (اگر resource)                             │
+│   - Drain node (اگر infra)                              │
+│   - Disable feature flag                                │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ 3. DIAGNOSE (بعد از stabilize)                          │
+│   - Layer by layer                                      │
+│   - Preserve evidence                                   │
+│   - Document timeline                                   │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ 4. RESOLVE                                              │
+│   - Fix root cause                                      │
+│   - Verify with smoke test                              │
+│   - Update runbook                                      │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ 5. POSTMORTEM (24-48h بعد)                              │
+│   - Blameless RCA                                       │
+│   - Action items                                        │
+│   - Prevention                                          │
+└─────────────────────────────────────────────────────────┘
+
+۱.۲ — قانون طلایی: "Mitigate First, Diagnose Second"
+
+اشتباه رایج تازه‌کارها: تلاش برای پیدا کردن root cause قبل از متوقف کردن bleeding. در production، اول کاربر را نجات بده، بعد ریشه را پیدا کن.
+bash
+
+# ❌ اشتباه:
+kubectl logs api-xyz | grep error | head -100  # کاربر همچنان down
+
+# ✅ درست:
+kubectl rollout undo deploy/api -n prod        # کاربر برمی‌گردد
+# سپس:
+kubectl logs api-xyz --previous | grep error   # ریشه
+
+۱.۳ — لایه‌بندی تشخیص (از پایین به بالا)
+text
+
+Layer 7: Application   →  logs, traces, /healthz
+Layer 6: Ingress       →  nginx logs, certificate
+Layer 5: Service       →  EndpointSlice, iptables
+Layer 4: Network       →  CNI, MTU, NetworkPolicy
+Layer 3: Container     →  crictl, runtime, probes
+Layer 2: Kubelet       →  systemctl, journalctl
+Layer 1: Node/OS       →  dmesg, df, free, sysctl
+Layer 0: Control Plane →  etcd, apiserver, certs
+
+🧰 بخش ۲: Toolbox واقعی DevOps
+۲.۱ — ابزارهای ضروری
+ابزار	نصب	کاربرد
+kubectl	apt/krew	پایه
+krew	brew install krew	پلاگین manager
+stern	kubectl krew install stern	multi-pod logs
+k9s	brew install k9s	TUI برای cluster
+kubectx/kubens	krew install ctx ns	context/ns switch
+kubectl-neat	krew install neat	حذف noise از YAML
+kubectl-tree	krew install tree	dependency graph
+kubectl-debug	krew install debug	ephemeral containers
+kubectl-df-pv	krew install df-pv	PV usage
+kubectl-images	krew install images	image inventory
+kubectl-cost	krew install cost	هزینه per workload
+kubectl-oomd	krew install oomd	OOM analysis
+kubectl-sick	krew install sick	health check
+kubectl-doctor	krew install doctor	diagnose
+kubent	download	deprecated API detector
+popeye	download	cluster sanitizer
+kube-bench	docker	CIS benchmark
+polaris	krew install polaris	best practice scan
+۲.۲ — نصب سریع
+bash
+
+# krew
+(
+  set -x; cd "$(mktemp -d)" &&
+  OS="$(uname | tr '[:upper:]' '[:lower:]')" &&
+  ARCH="$(uname -m | sed -e 's/x86_64/amd64/' -e 's/\(arm\)\(64\)\?.*/\1\2/' -e 's/aarch64$/arm64/')" &&
+  KREW="krew-${OS}_${ARCH}" &&
+  curl -fsSLO "https://github.com/kubernetes-sigs/krew/releases/latest/download/${KREW}.tar.gz" &&
+  tar zxvf "${KREW}.tar.gz" &&
+  ./"${KREW}" install krew
+)
+
+export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
+
+# پلاگین‌های ضروری
+kubectl krew install stern ctx ns neat tree debug df-pv images cost oomd sick doctor
+
+۲.۳ — Alias های استاندارد
+bash
+
+# ~/.bashrc یا ~/.zshrc
+alias k='kubectl'
+alias kg='kubectl get'
+alias kd='kubectl describe'
+alias kl='kubectl logs -f --tail=100'
+alias kx='kubectl exec -it'
+alias kaf='kubectl apply -f'
+alias kdel='kubectl delete'
+alias kctx='kubectl ctx'
+alias kns='kubectl ns'
+alias kew='kubectl events --watch'
+
+complete -F __start_kubectl k
+
+🔍 بخش ۳: Diagnostics Tools و Methodologies
+۳.۱ — First 5 Commands (همیشه)
+bash
+
+# ۱. وضعیت کلی
+kubectl get nodes -o wide
+kubectl get pods -A | grep -v Running | grep -v Completed
+
+# ۲. رویدادهای اخیر (طلایی!)
+kubectl get events -A --sort-by=.lastTimestamp | tail -30
+kubectl events --types=Warning
+
+# ۳. کنترل‌پلین
+kubectl get --raw='/readyz?verbose'
+
+# ۴. منابع (needs metrics-server)
+kubectl top nodes
+kubectl top pods -A --sort-by=memory | head -20
+
+# ۵. آخرین تغییرات (GitOps/Helm)
+helm list -A
+argocd app list 2>/dev/null
+
+۳.۲ — Stern — لاگ همه پادهای یک label
+bash
+
+# نصب: kubectl krew install stern
+
+# همه پادهای یک deployment:
+stern -n prod deploy/api --since 10m
+
+# چند label:
+stern -n prod -l app=api,tier=backend --since 5m
+
+# regex روی pod name:
+stern -n prod 'api-.*' --since 10m
+
+# همه پادهای یک node:
+stern -n prod --field-selector spec.nodeName=worker1
+
+# با output JSON برای parse:
+stern -n prod deploy/api -o json | jq 'select(.message | contains("error"))'
+
+# فقط خطاها:
+stern -n prod deploy/api --since 1h | grep -iE "error|exception|fail"
+
+🔧 چرا stern؟ kubectl logs فقط یک pod. برای rolling update با ۱۰ pod، stern همه را با prefix می‌دهد.
+۳.۳ — k9s — TUI برای دیباگ سریع
+bash
+
+k9s
+
+# کلیدهای مهم:
+# :pod            → لیست podها
+# :node           → نودها
+# :svc            → سرویس‌ها
+# :deploy         → دیپلوی‌ها
+# :ev             → events
+# :rb             → rollback
+# Enter           → جزئیات
+# l               → logs
+# s               → shell
+# d               → describe
+# e               → edit
+# y               → yaml
+# Ctrl+D          → delete
+# Shift+W         → watch mode
+
+🔧 چرا k9s؟ برای کارهای تکراری (چک لاگ، edit، delete) ۵x سریع‌تر از CLI.
+۳.۴ — kubectl-debug — Ephemeral Containers
+bash
+
+# نصب: kubectl krew install debug
+
+# دیباگ یک pod بدون shell (distroless):
+kubectl debug -it api-xyz --image=nicolaka/netshoot --target=api
+
+# داخل container دیباگ:
+# tcpdump -i eth0 port 8080
+# nslookup api-svc
+# curl -v localhost:8080/healthz
+# ss -tlnp
+# dig api-svc.default.svc.cluster.local
+
+🔧 چرا netshoot؟ مجموعه‌ی کامل ابزار شبکه (tcpdump, dig, curl, ss, netstat, iperf). برای دیباگ network بین ۲ pod عالی.
+bash
+
+# دیباگ node:
+kubectl debug node/worker1 -it --image=ubuntu
+
+# داخل pod دیباگ:
+chroot /host
+# access to host filesystem
+systemctl status kubelet
+journalctl -u kubelet -n 50
+crictl ps
+
+۳.۵ — kubectl-tree — Dependency Graph
+bash
+
+kubectl tree deploy/api -n prod
+# خروجی:
+# Deployment/api
+# └── ReplicaSet/api-7f8c9
+#     ├── Pod/api-7f8c9-abc
+#     ├── Pod/api-7f8c9-def
+#     └── Pod/api-7f8c9-ghi
+
+🔧 چرا؟ وقتی یک pod مشکل دارد، می‌خواهی بدانی از کدام ReplicaSet، از کدام Deployment آمده.
+🎭 بخش ۴: سناریوهای واقعی Production
+🎭 سناریو ۱: "Users report 500 errors"
+
+T=0min — Alert دریافت شد:
+text
+
+[FIRING:High5xxRate] error rate 12% (threshold 1%) for 5m
+
+T+2min — Triage:
+bash
+
+# ۱. چه چیزی تغییر کرده؟
+kubectl rollout history deploy/api -n prod
+# REVISION  CHANGE-CAUSE
+# 41        <none>
+# 42        <none>
+
+kubectl get deploy api -n prod -o jsonpath='{.status.updatedReplicas}/{.status.replicas}'
+# انتظار: اگر 3/5 → rolling update در جریان است
+
+# ۲. لاگ‌های ۵ دقیقه‌ی اخیر:
+stern -n prod deploy/api --since 5m | grep -iE "error|5[0-9]{2}"
+
+# خروجی نمونه:
+# api-7f8c9-abc api ERROR db connection refused: dial tcp 10.0.1.50:5432
+# api-7f8c9-def api ERROR db connection refused
+
+T+4min — Mitigate (اولویت):
+bash
+
+# اگر آخرین deploy مشکوک است:
+kubectl rollout undo deploy/api -n prod
+kubectl rollout status deploy/api -n prod --timeout=5m
+
+# ✅ چک: error rate برمی‌گردد؟
+# (از Grafana یا:)
+watch -n 5 'kubectl get pods -n prod -l app=api | grep -c Running'
+
+T+10min — Diagnose Root Cause:
+bash
+
+# چرا db connection refused؟
+kubectl get svc -n prod db
+kubectl get endpointslices -n prod -l kubernetes.io/service-name=db
+# NAME       ADDRESSES
+# db-xyz     []               ← خالی!
+
+# چرا endpoint خالی؟
+kubectl get pods -n prod -l app=db
+# NAME         READY   STATUS
+# db-0         0/1     Running     ← Ready نیست
+
+kubectl describe pod db-0 -n prod | tail -20
+# Events:
+# Warning  Unhealthy  Readiness probe failed: dial tcp 10.0.1.50:5432: connect: connection refused
+
+T+15min — Fix Root Cause:
+bash
+
+# پاد db Ready نیست — چرا؟
+kubectl logs db-0 -n prod --tail=50
+# ERROR: FATAL: password authentication failed
+
+# چک secret:
+kubectl get secret db-credentials -n prod -o jsonpath='{.data.password}' | base64 -d
+# newpass123
+
+# چک env pod:
+kubectl exec db-0 -- env | grep PASSWORD
+# PASSWORD=oldpass456  ← stale!
+
+# علت: secret از ۲ روز پیش تغییر کرده، پادهای قبلی restart نشده‌اند
+kubectl rollout restart sts/db -n prod
+
+# ✅ چک:
+kubectl get endpointslices -n prod -l kubernetes.io/service-name=db
+# ADDRESSES: [10.0.1.50]  ← حالا پر
+
+T+20min — Verify:
+bash
+
+# Smoke test:
+kubectl run test --rm -it --image=curlimages/curl -n prod -- \
+  curl -sf http://api.prod.svc/healthz && echo "✅ OK"
+
+# Metrics:
+# Grafana → error rate < 1%
+
+Postmortem Action Items:
+
+    ✅ checksum/config annotation برای pods که به secret وابسته‌اند
+
+    ✅ Alert برای endpointslices == 0 روی سرویس‌های حیاتی
+
+    ✅ External Secrets + auto-reload
+
+🎭 سناریو ۲: "Pod stuck in Pending"
+
+T=0:
+bash
+
+kubectl get pods -n prod | grep Pending
+# payment-api-xyz   0/1   Pending   0   15m
+
+T+1min — Describe (همیشه اول):
+bash
+
+kubectl describe pod payment-api-xyz -n prod | tail -15
+# Events:
+# Warning  FailedScheduling  default-scheduler  0/5 nodes are available:
+#          3 node(s) had untolerated taint {dedicated: payment},
+#          1 Insufficient memory,
+#          1 node(s) didn't match Pod's node affinity/selector.
+
+T+2min — تحلیل:
+bash
+
+# کدام نودها taint دارند؟
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
+# NAME      TAINTS
+# worker1   [map[effect:NoSchedule key:dedicated value:payment]]
+# worker2   [map[effect:NoSchedule key:dedicated value:payment]]
+# worker3   <none>
+# worker4   <none>
+# worker5   <none>
+
+# منابع:
+kubectl describe nodes | grep -A3 "Allocated resources"
+# worker3: memory requests: 95%
+# worker4: memory requests: 60%
+# worker5: memory requests: 40%
+
+# affinity pod:
+kubectl get pod payment-api-xyz -n prod -o jsonpath='{.spec.affinity}' | jq .
+# انتظار: nodeSelector یا affinity به dedicated=payment
+
+T+3min — تشخیص:
+
+پاد به nodeSelector: dedicated=payment نیاز دارد، اما آن نودها فقط taint دارند و نه label. mismatch بین taint و toleration.
+bash
+
+# چک label ها:
+kubectl get nodes --show-labels | grep dedicated
+# worker1: ... dedicated=payment ...
+# worker2: ... dedicated=payment ...
+# (ظاهراً label هست)
+
+T+4min — Re-check:
+bash
+
+# چرا pod روی worker1/2 زمان‌بندی نمی‌شود؟
+kubectl describe pod payment-api-xyz -n prod | grep -A5 "Tolerations"
+# Tolerations: (none)  ← ❗
+
+# علت: pod toleration ندارد! فقط nodeSelector دارد.
+# اما taint روی نودها آن را دفع می‌کند.
+
+T+5min — Fix:
+yaml
+
+# deployment.yaml
+spec:
+  template:
+    spec:
+      nodeSelector:
+        dedicated: payment
+      tolerations:              # ← این را اضافه کن
+        - key: dedicated
+          operator: Equal
+          value: payment
+          effect: NoSchedule
+
+bash
+
+kubectl apply -f deployment.yaml
+kubectl get pods -n prod | grep payment
+# payment-api-abc   1/1   Running   ← ✅
+
+🔧 درس: nodeSelector + taint بدون toleration = Pending. label = "من اینجا را دوست دارم"، toleration = "من می‌توانم اینجا باشم".
+🎭 سناریو ۳: "Pod در CrashLoopBackOff"
+
+T=0:
+bash
+
+kubectl get pods -n prod | grep CrashLoop
+# worker-xyz   0/1   CrashLoopBackOff   15   45m
+
+T+1min — First look:
+bash
+
+# Restart count و زمان:
+kubectl get pod worker-xyz -n prod -o jsonpath='{.status.containerStatuses[0]}' | jq .
+# {
+#   "restartCount": 15,
+#   "lastState": {
+#     "terminated": {
+#       "exitCode": 137,           ← ❗
+#       "reason": "OOMKilled",
+#       "startedAt": "2024-11-08T10:00:00Z",
+#       "finishedAt": "2024-11-08T10:00:30Z"
+#     }
+#   }
+# }
+
+# لاگ قبلی (previous = قبل از crash):
+kubectl logs worker-xyz -n prod --previous --tail=50
+
+Exit code های کلیدی:
+Exit	معنی	علت
+0	موفق	Job تمام شد
+1	خطای app	exception، config
+137	SIGKILL	OOMKilled یا kill دستی
+139	Segfault	binary bug
+143	SIGTERM	graceful shutdown
+126	Permission denied	exec permission
+127	Command not found	wrong ENTRYPOINT
+
+T+2min — اگر 137 (OOMKilled):
+bash
+
+# limits چقدر؟
+kubectl get pod worker-xyz -n prod -o jsonpath='{.spec.containers[0].resources}' | jq .
+# {
+#   "limits": {"memory": "256Mi"},
+#   "requests": {"memory": "128Mi"}
+# }
+
+# مصرف واقعی:
+kubectl top pod worker-xyz -n prod
+# NAME          CPU(cores)   MEMORY(bytes)
+# worker-xyz    450m         240Mi    ← نزدیک limit
+
+# چرا؟
+kubectl describe pod worker-xyz -n prod | grep -A2 "Last State"
+# Reason: OOMKilled
+# Message: container exceeded memory limit
+
+T+3min — Mitigate:
+bash
+
+# اگر می‌دانی 256Mi کم است:
+kubectl set resources deploy/worker -n prod \
+  --limits=memory=512Mi --requests=memory=256Mi
+
+# ✅ چک:
+kubectl get pods -n prod -l app=worker -w
+# انتظار: rolling update، همه Running
+
+T+4min — Diagnose واقعی:
+bash
+
+# چرا worker به 512Mi نیاز دارد؟ memory leak?
+# در pod:
+kubectl exec worker-xyz -- cat /sys/fs/cgroup/memory.current
+# 240M
+
+# heap dump (اگر Node.js):
+kubectl exec worker-xyz -- node --inspect=0.0.0.0:9229
+
+# یا log analysis:
+stern -n prod deploy/worker --since 1h | grep -iE "memory|gc|leak"
+
+T+10min — Long-term fix:
+yaml
+
+# اگر leak است: code fix
+# اگر نیاز واقعی است: increase limit + adjust HPA
+# اگر prefetch بزرگ است: lazy loading
+
+🔧 Anti-pattern: فقط limit را زیاد نکن. اگر leak است، 512Mi هم روزی پر می‌شود. همیشه reason را پیدا کن.
+🎭 سناریو ۴: "Node NotReady"
+
+T=0:
+bash
+
+kubectl get nodes | grep -v Ready
+# worker3   NotReady   worker   45d   v1.31.2
+
+T+1min — Check from kubectl:
+bash
+
+kubectl describe node worker3 | tail -20
+# Conditions:
+#   Type             Status  LastTransitionTime  Reason
+#   MemoryPressure   False   ...
+#   DiskPressure     True    10m ago             KubeletHasDiskPressure
+#   PIDPressure      False   ...
+#   Ready            False   10m ago             KubeletNotReady
+#                                                 node is not ready
+
+# Events:
+# Warning  EvictionThresholdMet  Attempting to reclaim nodefs
+
+T+2min — SSH و check OS:
+bash
+
+ssh worker3
+
+# ۱. Kubelet وضعیت:
+systemctl status kubelet
+# ● kubelet.service - kubelet: The Kubernetes Node Agent
+#    Active: active (running)  ← فعال، خوب
+
+# ۲. لاگ kubelet:
+journalctl -u kubelet -n 50 --no-pager | grep -iE "error|fail|pressure"
+# Nov 08 10:00:00 kubelet[1234]: E1108 ... eviction manager: eviction threshold met
+
+# ۳. دیسک:
+df -h /
+# Filesystem  Size  Used  Avail  Use%  Mounted on
+# /dev/sda1   50G   47G   3G     95%   /    ← ❗
+
+# ۴. بزرگ‌ترین مصرف‌کننده‌ها:
+du -sh /var/lib/containerd/* 2>/dev/null | sort -rh | head -5
+# 35G  /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
+# 8G   /var/lib/containerd/io.containerd.content.v1.content
+# 3G   /var/log/pods
+
+# ۵. لاگ پادها:
+du -sh /var/log/pods/* 2>/dev/null | sort -rh | head -5
+# 1.5G  /var/log/pods/prod_api-xyz_uid/api
+
+T+3min — Mitigate:
+bash
+
+# ۱. prune image های بدون استفاده:
+crictl rmi --prune
+# Deleted: sha256:... (x N)
+
+# ۲. پاک کردن لاگ‌های قدیمی:
+find /var/log/pods -name "*.log" -size +100M -mtime +3 -delete
+
+# ۳. اگر /var/lib/containerd بزرگ است:
+du -sh /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/*
+# 20G   /var/lib/containerd/.../<sha>
+# چک کن کدام image است:
+crictl images --digests | grep <sha>
+# اگر استفاده نمی‌شود: crictl rmi <id>
+
+# ✅ چک:
+df -h /
+# /dev/sda1   50G   30G   20G   60%   /    ← OK
+
+# ۴. Kubelet خودش retry می‌کند:
+# منتظر بمان 30s
+kubectl get nodes worker3
+# worker3   Ready   worker   45d   v1.31.2   ← ✅
+
+T+5min — Long-term:
+yaml
+
+# kubelet config.yaml — تنظیم eviction:
+evictionHard:
+  nodefs.available: "10%"    # پیش‌فرض
+  imagefs.available: "15%"
+
+evictionSoft:
+  nodefs.available: "20%"
+  imagefs.available: "25%"
+
+evictionSoftGracePeriod:
+  nodefs.available: "1m30s"
+  imagefs.available: "1m30s"
+
+bash
+
+# cron برای cleanup خودکار:
+# /etc/cron.daily/cleanup-containerd
+cat > /etc/cron.daily/cleanup-containerd <<'EOF'
+#!/bin/bash
+crictl rmi --prune 2>/dev/null
+find /var/log/pods -name "*.log" -mtime +7 -delete 2>/dev/null
+EOF
+chmod +x /etc/cron.daily/cleanup-containerd
+
+🔧 نکته: DiskPressure باعث eviction پادها می‌شود (به ترتیب QoS: BestEffort → Burstable → Guaranteed). اگر nod Ready نمی‌شود، check df -i هم بکن (inode exhaustion).
+🎭 سناریو ۵: "PVC در Pending"
+
+T=0:
+bash
+
+kubectl get pvc -n prod | grep Pending
+# data-db-0   Pending   ...   10m
+
+T+1min — Describe:
+bash
+
+kubectl describe pvc data-db-0 -n prod | tail -15
+# Events:
+# Warning  ProvisioningFailed  ...  storageclass "fast-ssd" not found
+
+T+2min — چک StorageClass:
+bash
+
+kubectl get storageclass
+# NAME              PROVISIONER
+# standard (default) k8s.io/minikube-hostpath
+# ← fast-ssd وجود ندارد!
+
+T+3min — Fix:
+bash
+
+# یا StorageClass موجود را استفاده کن:
+kubectl patch pvc data-db-0 -n prod \
+  -p '{"spec":{"storageClassName":"standard"}}'
+
+# یا StorageClass جدید بساز:
+kubectl apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "3000"
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+EOF
+
+# ✅ چک:
+kubectl get pvc -n prod
+# data-db-0   Bound   pvc-xyz   10Gi   ...   ← ✅
+
+T+5min — اگر همچنان Pending:
+bash
+
+# چک provisioner:
+kubectl get pods -n kube-system | grep csi
+# اگر خالی: CSI driver نصب نیست
+
+kubectl logs -n kube-system deploy/ebs-csi-controller --tail=50
+# اگر permission error است → IAM ServiceAccount مشکل
+
+# چک topology:
+kubectl describe pv <pv-name> | grep -A5 "Node Affinity"
+# اگر zone اشتباه است → pod را در zone درست بفرست
+
+🔧 نکته: WaitForFirstConsumer = PVC تا زمان pod باقی می‌ماند. طبیعی است. اگر pod در ContainerCreating گیر کرده و PVC هم Pending، scheduler مشکل دارد.
+🎭 سناریو ۶: "DNS resolution Failure"
+
+T=0: لاگ اپ:
+text
+
+lookup api-svc on 10.96.0.10:53: no such host
+
+T+1min — CoreDNS check:
+bash
+
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+# اگر CrashLoopBackOff → مستقیم به Fix
+# اگر Running:
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50 | grep -iE "error|refused|timeout"
+
+T+2min — Test داخل پاد:
+bash
+
+kubectl run dnstest --rm -it --image=nicolaka/netshoot --restart=Never -- \
+  bash -c '
+    echo "=== resolv.conf ==="
+    cat /etc/resolv.conf
+    echo "=== nslookup external ==="
+    nslookup google.com
+    echo "=== nslookup internal ==="
+    nslookup kubernetes.default
+    echo "=== dig with trace ==="
+    dig +trace api-svc.default.svc.cluster.local
+  '
+
+سناریو A: external OK, internal FAIL
+bash
+
+# CoreDNS نمی‌تواند K8s API را بخواند
+kubectl logs -n kube-system -l k8s-app=kube-dns | grep -iE "kube|api"
+# اگر: "Failed to watch *v1.Service: forbidden"
+# → RBAC CoreDNS شکسته
+
+# Fix:
+kubectl describe clusterrole system:coredns
+# اگر permissions کامل نیست → restore:
+kubectl apply -f https://raw.githubusercontent.com/coredns/deployment/master/kubernetes/coredns.yaml
+
+سناریو B: internal OK, external FAIL
+bash
+
+# upstream DNS نود خراب
+# در pod دیباگ:
+cat /etc/resolv.conf
+# nameserver 10.96.0.10
+# options ndots:5
+
+# روی نود:
+cat /etc/resolv.conf
+# nameserver 8.8.8.8   ← upstream
+
+# اگر نود upstream ندارد:
+# در /etc/resolv.conf نود اضافه کن
+# یا در CoreDNS configmap:
+kubectl -n kube-system edit cm coredns
+# forward . 8.8.8.8 1.1.1.1
+
+سناریو C: DNS OK ولی intermittent
+bash
+
+# احتمالاً NetworkPolicy یا conntrack
+# چک:
+kubectl get networkpolicies -n prod
+
+# در pod:
+while true; do nslookup api-svc; sleep 1; done 2>&1 | head -20
+# اگر intermittently fails:
+# - conntrack table full:
+dmesg | grep -i conntrack
+# - kube-proxy مشکل:
+kubectl -n kube-system logs ds/kube-proxy-xxx
+
+🔧 نکته: ndots:5 یعنی api-svc ابتدا به صورت api-svc.namespace.svc.cluster.local جستجو می‌شود. برای FQDN، dot انتهایی بگذار: api-svc. (بدون search).
+🎭 سناریو ۷: "Ingress 502/504"
+
+T=0: کاربران در Slack:
+text
+
+502 Bad Gateway از https://api.example.com
+
+T+1min — چک Ingress:
+bash
+
+kubectl get ingress api -n prod
+# NAME   CLASS   HOSTS                ADDRESS         PORTS
+# api    nginx   api.example.com      10.0.0.100      80,443   ← OK
+
+kubectl describe ingress api -n prod | tail -10
+# Rules:
+#   Host                Path  Backends
+#   api.example.com
+#                       /     api-svc:80 (10.0.1.20:8080,10.0.1.21:8080)
+
+T+2min — لاگ Ingress Controller:
+bash
+
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller --tail=100 | grep -iE "api|error"
+# 2024/11/08 10:00 [error] connect() failed (111: Connection refused) while connecting to upstream
+# → backend unreachable
+
+T+3min — Check Endpoints:
+bash
+
+kubectl get endpointslices -n prod -l kubernetes.io/service-name=api-svc
+# ADDRESSES
+# [10.0.1.20, 10.0.1.21]  ← پر
+
+# چک pod:
+kubectl get pods -n prod -l app=api
+# NAME         READY   STATUS
+# api-abc      1/1     Running
+# api-def      1/1     Running
+
+# چک از داخل cluster:
+kubectl run test --rm -it --image=nicolaka/netshoot -n prod -- \
+  curl -v http://10.0.1.20:8080/healthz
+# curl: (7) Failed to connect to 10.0.1.20 port 8080: Connection refused
+# ← pod listen نمی‌کند!
+
+T+5min — Check Pod:
+bash
+
+# پاد listen کجاست؟
+kubectl exec api-abc -n prod -- ss -tlnp
+# State   Local Address:Port
+# LISTEN  0.0.0.0:8000     ← 8000 نه 8080!
+
+# چرا targetPort=8080؟
+kubectl get svc api-svc -n prod -o jsonpath='{.spec.ports}'
+# [{"name":"http","port":80,"targetPort":8080,"protocol":"TCP"}]
+# ← targetPort=8080 اشتباه، باید 8000 باشد
+
+T+6min — Fix:
+bash
+
+# در Service:
+kubectl patch svc api-svc -n prod \
+  -p '{"spec":{"ports":[{"name":"http","port":80,"targetPort":8000,"protocol":"TCP"}]}}'
+
+# ✅ چک:
+kubectl get endpointslices -n prod -l kubernetes.io/service-name=api-svc
+kubectl run test --rm -it --image=curlimages/curl -n prod -- \
+  curl -v http://api-svc/healthz && echo "✅ OK"
+
+T+8min — اگر 504 (timeout):
+bash
+
+# Backend کند است
+kubectl exec api-abc -n prod -- \
+  time curl -s localhost:8000/healthz
+# real  0m15.5s   ← ۱۵ ثانیه!
+
+# Ingress timeout:
+kubectl get ingress api -n prod -o yaml | grep timeout
+# nginx.ingress.kubernetes.io/proxy-read-timeout: 30
+
+# افزایش timeout:
+kubectl annotate ingress api -n prod \
+  nginx.ingress.kubernetes.io/proxy-read-timeout="120" --overwrite
+
+# اما ریشه: چرا 15s؟
+kubectl exec api-abc -n prod -- cat /proc/loadavg
+# 15.2  ← CPU saturation
+kubectl top pod api-abc -n prod
+# 950m/1000m  ← 95% CPU
+# → HPA یا scale up
+
+🔧 502 vs 504:
+
+    502 = Ingress به backend نرسید (connection refused)
+
+    504 = رسید ولی پاسخ نداد (timeout)
+
+🎭 سناریو ۸: "High API Latency"
+
+T=0: Alert:
+text
+
+[FIRING:KubeAPIHighLatency] p99=5s (threshold 1s)
+
+T+1min:
+bash
+
+time kubectl get nodes
+# real 0m3.5s  ← کند
+
+# چک readyz:
+kubectl get --raw='/readyz?verbose' | tail -20
+# [+][-]etcd failed: etcdserver: request timed out
+
+T+2min — etcd check:
+bash
+
+kubectl -n kube-system exec etcd-master1 -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  --endpoints=https://127.0.0.1:2379 \
+  endpoint status -w table
+# ENDPOINT      DB SIZE   IS LEADER   RAFT INDEX   ...
+# 127.0.0.1:2379  4.5GB   true        12345678
+
+# DB size 4.5GB ← بزرگ!
+# alert threshold معمولاً 2GB
+
+T+3min — etcd latency:
+bash
+
+kubectl -n kube-system exec etcd-master1 -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint check perf --load=s=500
+# PASS: Throughput is 3200/s. Slowest request took 45ms
+
+# چک fsync:
+kubectl -n kube-system exec etcd-master1 -- etcdctl \
+  --cacert=... defrag --command-timeout=60s
+
+T+4min — Defrag:
+bash
+
+# ⚠️ defrag روی هر عضو جدا (نه همزمان)
+for member in master1 master2 master3; do
+  kubectl -n kube-system exec etcd-$member -- etcdctl \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    defrag --command-timeout=300s
+  echo "✅ $member defraged"
+  sleep 30
+done
+
+T+10min — اگر حل نشد:
+bash
+
+# disk IO:
+iostat -x 1 5
+# await > 25ms → disk کند
+# علت: SSD نه NVMe، یا disk اشتراکی
+
+# network بین etcd ها:
+ping -c 100 -i 0.01 master2 | tail -3
+# rtt avg باید < 1ms باشد
+
+T+15min — Root Cause:
+bash
+
+# چرا DB 4.5GB?
+# events قدیمی؟
+kubectl get events --field-selector type=Warning --sort-by=.lastTimestamp | wc -l
+# 150000  ← هر event 24h TTL دارد، اما...
+
+# کدام resource بیشترین تعداد؟
+kubectl get --raw='/metrics' | grep -E "apiserver_request_total.*code=\"2..\"" | sort -t'}' -k2 -rn | head
+
+# compaction:
+kubectl -n kube-system exec etcd-master1 -- etcdctl \
+  --cacert=... compact $(etcdctl endpoint status -w json | jq '.[0].Status.header.revision')
+
+🔧 نکته: defrag blocking است (روی هر عضو چند ثانیه تا چند دقیقه). هرگز همزمان روی همه اجرا نکن — quorum می‌شکند.
+📋 بخش ۵: Runbooks استاندارد
+۵.۱ — Runbook: Pod NotStarting
+markdown
+
+# RUNBOOK: Pod NotStarting
+
+## 1. Triage
+kubectl get pod <name> -n <ns> -o wide
+kubectl describe pod <name> -n <ns> | tail -20
+
+## 2. Status-specific actions
+
+### Pending
+- [ ] `FailedScheduling` در events؟
+  - [ ] resources: `kubectl describe nodes | grep Allocated`
+  - [ ] taint: `kubectl describe node <n> | grep Taints`
+  - [ ] affinity: `kubectl get pod <n> -o jsonpath='{.spec.affinity}'`
+  - [ ] PVC: `kubectl get pvc -n <ns>`
+
+### ImagePullBackOff
+- [ ] `docker pull <image>` دستی
+- [ ] `imagePullSecret` موجود؟
+- [ ] registry credentials در secret درست؟
+
+### CrashLoopBackOff
+- [ ] `kubectl logs <pod> --previous`
+- [ ] exit code:
+  - [ ] 137 → OOMKilled → `kubectl describe | grep -A2 Limits`
+  - [ ] 1 → app error
+- [ ] probe: `kubectl describe | grep -A5 Liveness`
+
+### CreateContainerConfigError
+- [ ] ConfigMap/Secret وجود دارد؟
+- [ ] key درست است؟
+
+## 3. Escalate if
+- Control plane involved
+- Multi-node impact
+- Data loss risk
+
+## 4. Post-fix
+- [ ] Smoke test
+- [ ] Update this runbook
+
+۵.۲ — Runbook: Node NotReady
+markdown
+
+# RUNBOOK: Node NotReady
+
+## 1. Scope check
+kubectl get nodes
+kubectl describe node <n> | grep -A5 Conditions
+
+## 2. SSH access
+ssh <node>
+systemctl status kubelet
+journalctl -u kubelet -n 100 --no-pager | grep -iE "error|fail"
+
+## 3. Pressure-specific
+
+### DiskPressure
+- [ ] `df -h` / `df -i`
+- [ ] `du -sh /var/lib/containerd/*`
+- [ ] `crictl rmi --prune`
+- [ ] پاک کردن لاگ‌های قدیمی
+
+### MemoryPressure
+- [ ] `free -h`
+- [ ] `kubectl top pods --field-selector spec.nodeName=<n>`
+- [ ] Eviction سریع
+
+### PIDPressure
+- [ ] `ps aux | wc -l`
+- [ ] `cat /proc/sys/kernel/pid_max`
+
+## 4. CNI-specific
+- [ ] `ls /etc/cni/net.d/`
+- [ ] `crictl ps | grep calico\|cilium`
+- [ ] `lsmod | grep overlay`
+
+## 5. Recovery
+- [ ] `kubectl drain <n> --ignore-daemonsets --delete-emptydir-data`
+- [ ] Fix on node
+- [ ] `kubectl uncordon <n>`
+
+## 6. Escalate if
+- Hardware failure suspected
+- Multiple nodes impacted
+- etcd quorum at risk (control plane)
+
+🎯 بخش ۶: Anti-Patterns در Troubleshooting
+Anti-Pattern	چرا بد	درست
+kubectl delete pod بدون diagnose	root cause گم می‌شود	describe + logs --previous اول
+kubectl edit در prod	drift، بدون audit	GitOps / patch با annotation
+--force --grace-period=0 اول کار	data corruption	آخرین راه‌حل
+restart kubelet کورکورانه	دیسک/CNI مشکل واقعی است	journalctl قبل از restart
+kubectl exec ... bash بدون log	دستکاری زنده	read-only commands
+فقط metric ببین، log نه	context گم می‌شود	metrics + logs + traces
+debug در prod بدون break-glass	audit گم می‌شود	با approval + session recording
+kubectl logs بدون --previous	crash loop گم می‌شود	--previous را عادت کن
+همه pods را همزمان restart	outage	rolling restart
+بدون kubectl get events	اولین منبع truth	همیشه اول events
+📊 بخش ۷: چک‌لیست سریع On-Call
+text
+
+┌──────────────────────────────────────────────────┐
+│  T=0: Alert                                       │
+│  ├─ Severity و scope را تعیین کن                 │
+│  ├─ War room / Slack thread باز کن               │
+│  └─ Recent changes: git log, helm history         │
+├──────────────────────────────────────────────────┤
+│  T+2: Mitigate                                    │
+│  ├─ اگر deploy: rollback                         │
+│  ├─ اگر resources: scale up                      │
+│  ├─ اگر node: cordon + drain                     │
+│  └─ اگر DNS: restart coredns                     │
+├──────────────────────────────────────────────────┤
+│  T+5: Diagnose (بعد از stabilize)                 │
+│  ├─ kubectl get events -A                         │
+│  ├─ kubectl describe <resource>                   │
+│  ├─ kubectl logs <pod> --previous                 │
+│  ├─ stern برای multi-pod                          │
+│  └─ kubectl debug برای container بدون shell       │
+├──────────────────────────────────────────────────┤
+│  T+15: Fix root cause                             │
+│  ├─ Apply fix در staging اول                      │
+│  ├─ Verify در staging                             │
+│  └─ Apply در prod با canary                       │
+├──────────────────────────────────────────────────┤
+│  T+30: Verify                                     │
+│  ├─ Smoke test                                    │
+│  ├─ Metrics: error rate, latency                  │
+│  └─ User-facing check                             │
+├──────────────────────────────────────────────────┤
+│  T+24h: Postmortem                                │
+│  ├─ Timeline                                      │
+│  ├─ Root cause (5 why)                            │
+│  ├─ What went well / wrong                        │
+│  └─ Action items با owner و deadline              │
+└──────────────────────────────────────────────────┘
+
+🔧 بخش ۸: ابزارهای پیشرفته برای دیباگ
+۸.۱ — eBPF Tracing با Cilium Hubble
+bash
+
+# اگر Cilium داری:
+cilium hubble enable --ui
+cilium hubble port-forward &
+hubble observe --namespace prod --last 100
+# هر connection به هر pod، با verdict (FORWARDED/DROPPED)
+
+# فیلتر:
+hubble observe --verdict DROPPED --namespace prod --last 50
+# → NetworkPolicy که drop می‌کند
+
+۸.۲ — Sysdig / Falco
+bash
+
+# Falco — تشخیص رفتار مشکوک در real-time:
+# - shell در container
+# - write به /etc
+# - network connection به آدرس مشکوک
+
+kubectl logs -n falco -l app=falco --tail=50 | grep -iE "shell|sensitive"
+
+۸.۳ — Continuous Profiling
+bash
+
+# pyroscope / parca برای CPU flame graph در prod:
+kubectl -n monitoring port-forward svc/pyroscope 4040:4040
+# → http://localhost:4040 → انتخاب pod → flame graph
+
+۸.۴ — Distributed Tracing
+bash
+
+# Jaeger/Tempo — اگر app trace دارد:
+# یک request را با trace ID دنبال کن
+kubectl -n tracing port-forward svc/jaeger 16686:16686
+# → http://localhost:16686 → search by trace ID
+
+📝 بخش ۹: Post-Incident Best Practices
+۹.۱ — Blameless Postmortem Template
+markdown
+
+# Postmortem: [Incident Name]
+**Date:** 2024-11-08  
+**Duration:** 25min (10:00 → 10:25 UTC)  
+**Severity:** SEV2  
+**Impact:** 12% error rate on /api/v1/users, ~3K requests affected
+
+## Timeline (UTC)
+- 10:00 — Deploy revision 42 starts
+- 10:02 — Error rate alert fires (12%)
+- 10:05 — On-call acknowledges
+- 10:08 — Rollback initiated
+- 10:10 — Error rate back to <1%
+- 10:15 — Root cause: stale secret
+- 10:25 — Fixed + verified
+
+## Root Cause (5 Why)
+1. Why 500 errors? → DB connection refused
+2. Why connection refused? → pod had stale password
+3. Why stale password? → secret updated 2 days ago
+4. Why pod didn't reload? → no checksum/config annotation
+5. Why no annotation? → not in deployment template
+
+## What went well
+- Alert fired within 2min
+- Rollback worked cleanly
+- Runbook followed
+
+## What went wrong
+- Secret rotation didn't trigger pod restart
+- No alert on `endpointslices == 0` for critical services
+
+## Action Items
+| # | Action | Owner | Due |
+|---|---|---|---|
+| 1 | Add checksum/config to deployment | @alice | 1w |
+| 2 | External Secrets with auto-reload | @bob | 2w |
+| 3 | Alert on empty endpointslices | @charlie | 1w |
+| 4 | Update runbook | @alice | 3d |
+
+## Lessons
+- Secrets are state, not config — treat with lifecycle
+- Alert on user-facing symptom (5xx), not just infra
+
+۹.۲ — Alert Quality Metrics
+text
+
+Target for on-call health:
+- MTTA (Mean Time To Acknowledge) < 5min
+- MTTR (Mean Time To Resolve) < 30min
+- False positive rate < 20%
+- Actionable alerts > 90%
+
+اگر alert:
+- هر هفته fire می‌شود ولی action ندارد → حذف یا اصلاح
+- کسی نمی‌داند چه کند → runbook اضافه
+- بعد از incident fire نشد → alert جدید اضافه
+
+🎯 جمع‌بندی: چک‌لیست ۳۰ ثانیه‌ای On-Call
+bash
+
+# 1. Scope
+kubectl get nodes
+kubectl get pods -A | grep -vE "Running|Completed"
+
+# 2. Events
+kubectl get events -A --sort-by=.lastTimestamp | tail -20
+
+# 3. Recent changes
+kubectl rollout history deploy -A --revision=0 2>/dev/null
+
+# 4. API health
+kubectl get --raw='/readyz'
+
+# 5. Control plane
+kubectl get pods -n kube-system | grep -vE "Running|Completed"
+
+# 6. Resources
+kubectl top nodes
+kubectl top pods -A --sort-by=memory | head -10
+
+# 7. Logs
+stern -n <suspected-ns> deploy/<suspected-deploy> --since 5m | grep -iE "error|fail"
+
+ 

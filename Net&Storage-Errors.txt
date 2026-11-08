@@ -1,0 +1,557 @@
+﻿🌐 خطاهای شبکه و ذخیره‌سازی در Kubernetes — تحلیل عمیق و عملیاتی
+
+    هر سناریو با ساختار: علامت → ریشه فنی → مسیر排查 → رفع ارائه می‌شود. دستورات قابل اجرا در محیط واقعی هستند.
+
+بخش اول: خطاهای شبکه (Networking)
+🌐 سناریوی ۱: DNS Resolution Failure — پاد نمی‌تواند نام سرویس را resolve کند
+علامت
+text
+
+$ curl http://api-svc:8080
+curl: (6) Could not resolve host: api-svc
+
+یا در لاگ اپلیکیشن: dial tcp: lookup api-svc on 10.96.0.10:53: no such host
+
+همچنین ممکن است فقط برای برخی نام‌ها (مثلاً خارجی) خطا بدهد و نام‌های داخلی کار کنند.
+ریشه فنی
+
+سه لایه در مسیر DNS پاد دخیل هستند:
+
+    /etc/resolv.conf پاد — حاوی nameserver (ClusterIP سرویس kube-dns، معمولاً 10.96.0.10) و search domains. گزینه ndots تعیین می‌کند چند dot در نام باعث شود ابتدا absolute query ارسال شود.
+
+    CoreDNS Pods — اگر CrashLoop یا Overload باشند، هیچ query پاسخ نمی‌گیرد.
+
+    Upstream resolver — CoreDNS برای نام‌های خارجی به resolv.conf نود مراجعه می‌کند.
+
+نکته‌ی حیاتی ndots: پیش‌فرض ndots:5 است. نامی مثل api-svc (بدون dot) ابتدا با search domain ها ترکیب می‌شود (api-svc.default.svc.cluster.local و…)؛ اگر api-svc یک FQDN خارجی کوتاه باشد، این کار باعث تأخیر و شکست می‌شود.
+
+تفاوت musl vs glibc: ایمیج‌های Alpine/BusyBox (musl) ممکن است ndots و search domain را متفاوت از glibc تفسیر کنند — این باعث می‌شود DNS در یک اپلیکیشن کار کند و در دیگری نه، با همان کانفیگ کلاستر.
+مسیر排查
+bash
+
+# ۱. آیا CoreDNS سالم است؟
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+kubectl top pods -n kube-system -l k8s-app=kube-dns   # Overload؟
+
+# ۲. داخل پاد تست، resolv.conf را ببین
+kubectl exec -it <test-pod> -- cat /etc/resolv.conf
+# باید nameserver=ClusterIP kube-dns و search شامل namespace و cluster.local باشد
+
+# ۳. آیا به سرویس DNS می‌رسیم؟ (با ClusterIP، نه نام)
+kubectl exec -it <test-pod> -- nslookup kubernetes.default
+
+# ۴. آیا نام داخلی resolve می‌شود؟
+kubectl exec -it <test-pod> -- nslookup api-svc.default.svc.cluster.local
+
+# ۵. آیا نام خارجی resolve می‌شود؟
+kubectl exec -it <test-pod> -- nslookup google.com
+# اگر داخلی OK و خارجی FAIL → مشکل upstream resolver نود یا NetworkPolicy egress به پورت 53
+
+رفع
+علت	راه‌حل
+CoreDNS CrashLoop	kubectl logs -n kube-system <coredns-pod> → معمولاً ConfigMap خراب یا کمبود منابع
+CoreDNS Overload	افزایش replica یا resources.requests/limits
+ndots بالا برای نام خارجی	افزودن dot انتهایی (google.com.) یا تنظیم dnsConfig.options در Pod spec
+NetworkPolicy مسدودکننده DNS	اجازه egress به UDP/TCP 53 در namespace مقصد
+musl vs glibc	ایمیج glibc-based (Ubuntu/Debian) برای اپ‌هایی که به search domain وابسته‌اند
+
+🔧 جزئیات فنی: NetworkPolicy در بسیاری از CNI ها (Calico، Cilium) روی DNS اعمال می‌شود. اگر یک default-deny egress اضافه کرده‌اید و قاعده‌ی allow برای kube-system + پورت 53 نگذاشته‌اید، همه‌ی resolve ها fail می‌شوند در حالی که پاد Running است.
+🌐 سناریوی ۲: Service بدون Endpoint — ClusterIP به هیچ پادی مسیر ندارد
+علامت
+text
+
+$ curl http://api-svc:8080
+curl: (7) Failed to connect to api-svc port 8080: Connection refused
+
+یا timeout (اگر EndpointSlice وجود نداشته باشد و kube-proxy هیچ قاعده‌ای نسازد).
+ریشه فنی
+
+زنجیره‌ی سرویس‌دهی در Kubernetes:
+text
+
+Service (selector) → EndpointSlice → kube-proxy (iptables/IPVS) → Pod IP
+
+kube-proxy روی هر نود، قواعد iptables یا IPVS را طوری برنامه‌ریزی می‌کند که ترافیک به ClusterIP را به IP پادهای Ready در EndpointSlice هدایت کند. اگر EndpointSlice خالی باشد، هیچ backend ای وجود ندارد و سرویس غیرقابل دسترسی می‌شود.
+
+علت خالی بودن EndpointSlice:
+
+    Selector mismatch — label سرویس با label پادها نمی‌خواند (case-sensitive).
+
+    Readiness probe fail — پاد Running است اما Ready نیست → از EndpointSlice حذف می‌شود.
+
+    پاد در namespace دیگری — selector فقط همان namespace را می‌بیند.
+
+    kube-proxy خراب — حتی با EndpointSlice سالم، قواعد iptables/IPVS به‌روز نمی‌شوند.
+
+مسیر排查
+bash
+
+# ۱. EndpointSlice خالی است؟
+kubectl get endpointslices -n <ns> -l kubernetes.io/service-name=<svc>
+kubectl get endpoints <svc>   # legacy
+
+# اگر خالی بود → مشکل upstream از kube-proxy (selector/readiness)
+
+# ۲. selector سرویس را با label پادها مقایسه کن
+kubectl describe svc <svc> | grep Selector
+kubectl get pods -n <ns> --show-labels | grep <selector-value>
+
+# ۳. آیا پاد Ready است؟
+kubectl get pods -n <ns> -l <selector>
+# STATUS=Running اما READY=0/1 → readiness probe fail
+
+# ۴. اگر EndpointSlice پر است ولی ترافیک نمی‌رود → kube-proxy
+kubectl get pods -n kube-system -l k8s-app=kube-proxy
+# روی نود (در حالت iptables):
+sudo iptables -t nat -L KUBE-SERVICES -n | grep <ClusterIP>
+# در حالت IPVS:
+sudo ipvsadm -Ln | grep <ClusterIP>
+
+تشخیص iptables vs IPVS: kubectl logs -n kube-system <kube-proxy-pod> | grep "Using" — نشان می‌دهد در چه mode ای است. در IPVS اگر ماژول‌های kernel نباشند، kube-proxy با خطا exit می‌کند (نه fallback خودکار).
+رفع
+علت	راه‌حل
+Selector mismatch	kubectl patch svc <svc> -p '{"spec":{"selector":{"app":"correct"}}}'
+Readiness fail	probe را درست کن (initialDelaySeconds, httpGet.path)؛ یا موقتاً probe را حذف کن
+kube-proxy CrashLoop	kubectl logs -n kube-system <kube-proxy> → معمولاً مشکل kernel module یا permission
+iptables rules گمشده	kube-proxy را restart کن: kubectl delete pod -n kube-system -l k8s-app=kube-proxy
+🌐 سناریوی ۳: CNI Failure — پاد ContainerCreating گیر می‌کند یا شبکه‌ی یک نود قطع می‌شود
+علامت
+
+    پادهای جدید روی یک نود در ContainerCreating می‌مانند.
+
+    پادهای موجود روی همان نود Running هستند اما به سرویس‌ها و پادهای دیگر نمی‌رسند.
+
+    نود ممکن است Ready بماند (kubelet سالم است) اما NetworkUnavailable=True باشد.
+
+ریشه فنی
+
+kubelet برای ساخت sandbox شبکه‌ی پاد به CNI plugin مراجعه می‌کند. اگر CNI DaemonSet روی آن نود اجرا نشود یا کانفیگ /etc/cni/net.d/ مشکل داشته باشد، kubelet نمی‌تواند شبکه را بسازد و NetworkReady=false گزارش می‌دهد.
+
+علت‌های شاخص:
+علت	نشانه
+CNI DaemonSet Pod روی نود fail	پادهای جدید ContainerCreating، پادهای قبلی connectivity از دست می‌دهند
+MTU mismatch	پینگ کوچک OK، اما HTTP بعد از handshake hang می‌کند
+Conntrack table full	timeout متناوب زیر بار؛ nf_conntrack: table full در dmesg
+Firewall مسدودکننده پورت‌های CNI	ترافیک بین‌نودی قطع، ترافیک intra-node سالم
+CNI config version skew با containerd	FailedCreatePodSandBox با پیام incompatible CNI version
+
+محاسبه MTU: اگر NIC فیزیکی 1500 باشد و overlay از VXLAN استفاده کند (overhead ≈ 50 بایت)، MTU پاد باید حداکثر 1450 باشد؛ در غیر این صورت بسته‌های بزرگ‌تر از path MTU بی‌صدا drop می‌شوند.
+مسیر排查
+bash
+
+# ۱. آیا CNI pod روی نود مشکل‌دار اجرا می‌شود؟
+kubectl get pods -n kube-system --field-selector spec.nodeName=<node> -o wide
+# Calico: calico-node / Cilium: cilium-xxxx / Flannel: kube-flannel-ds-xxxx
+
+# ۲. لاگ CNI pod
+kubectl logs -n kube-system <cni-pod>
+
+# ۳. رویدادهای sandbox
+kubectl get events --field-selector reason=FailedCreatePodSandBox --sort-by=.lastTimestamp
+
+# ۴. روی نود — کانفیگ CNI
+sudo ls /etc/cni/net.d/
+sudo cat /etc/cni/net.d/*.conflist | grep -E "cniVersion|mtu"
+
+# ۵. روی نود — MTU هاست و پاد
+ip link show $(ip route show default | awk '{print $5}' | head -1) | grep mtu
+kubectl exec <pod> -- ip link show eth0 | grep mtu
+
+# ۶. Conntrack
+echo "scale=2; $(cat /proc/sys/net/netfilter/nf_conntrack_count)*100/$(cat /proc/sys/net/netfilter/nf_conntrack_max)" | bc
+
+# ۷. پورت‌های CNI (مثال VXLAN)
+sudo ss -ulnp | grep -E "8472|8285"
+
+رفع
+علت	راه‌حل
+CNI pod CrashLoop	kubectl logs و kubectl describe → معمولاً RBAC، image pull، یا کانفیگ
+MTU mismatch	در CNI DaemonSet یا Helm values مقدار MTU را برابر NIC_MTU - overlay_overhead تنظیم کن
+Conntrack full	sysctl -w net.netfilter.nf_conntrack_max=<higher> و در /etc/sysctl.d/ پایدار کن
+Config version skew	cniVersion را با نسخه‌ی containerd سازگار کن؛ containerd --version را چک کن
+
+🔧 نکته‌ی عملیاتی حیاتی: اصلاح CNI فقط روی پادهای جدید اثر می‌گذارد. پادهایی که قبل از تغییر CNI ساخته شده‌اند، شبکه‌شان از قبل پیکربندی شده و دست‌نخورده می‌مانند — بنابراین ممکن است تغییر را اعمال کنی و ببینی «هیچ چیز درست نشد»، در حالی که فقط باید پادهای قدیمی را recreate کنی.
+🌐 سناریوی ۴: Ingress 502 / 504 — خطای Gateway از سمت Ingress Controller
+علامت
+text
+
+HTTP/1.1 502 Bad Gateway
+
+یا
+text
+
+HTTP/1.1 504 Gateway Timeout
+
+لاگ NGINX Ingress: connect() failed (111: Connection refused) یا upstream timed out.
+ریشه فنی
+
+502 یعنی Ingress Controller به backend وصل نشد:
+
+    targetPort سرویس با پورت listen کانتینر نمی‌خواند.
+
+    پاد backend در حال restart است.
+
+    Readiness probe fail → EndpointSlice خالی.
+
+504 یعنی وصل شد اما پاسخ به موقع نیامد: upstream کند است یا timeout پیکربندی‌شده کوتاه است.
+
+نکته‌ی Rolling Update: هنگام حذف پاد، دو فرآیند موازی اجرا می‌شوند: (۱) خاتمه‌ی پاد، (۲) به‌روزرسانی routing. اگر اپلیکیشن فوراً SIGTERM را بپذیرد و اتصال را ببندد در حالی که Ingress هنوز آن را در backend نگه داشته، 502 رخ می‌دهد. راه‌حل استاندارد: preStop hook با sleep تا ثبت‌زدایی Ingress کامل شود.
+مسیر排查
+bash
+
+# ۱. ADDRESS در Ingress پر شده؟ (اگر نه، controller آن را پردازش نکرده)
+kubectl get ingress <name> -o wide
+
+# ۲. لاگ controller
+kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx --tail=100 | grep -iE "error|refused|timeout"
+
+# ۳. EndpointSlice سرویس backend
+kubectl get endpointslices -n <ns> -l kubernetes.io/service-name=<svc>
+
+# ۴. تطابق targetPort با پورت کانتینر
+kubectl get svc <svc> -o jsonpath='{.spec.ports[*].targetPort}'
+kubectl get pod <backend-pod> -o jsonpath='{.spec.containers[*].ports[*].containerPort}'
+
+# ۵. تست مستقیم به پاد از داخل کلاستر
+kubectl run tmp --rm -it --image=curlimages/curl --restart=Never -- \
+  curl -v http://<backend-pod-ip>:<containerPort>/healthz
+
+# ۶. تست از داخل controller pod
+kubectl exec -n ingress-nginx <controller-pod> -- curl -v http://<svc>:<port>
+
+رفع
+خطا	علت	رفع
+502 + Connection refused	targetPort اشتباه	kubectl edit svc <svc> → targetPort = containerPort
+502 + readiness fail	پاد Ready نیست	probe را اصلاح کن؛ یا موقتاً readinessProbe را حذف کن
+502 در زمان rolling update	SIGTERM فوری	lifecycle.preStop.exec.command: ["sleep","10"] اضافه کن
+504	upstream کند / timeout	nginx.ingress.kubernetes.io/proxy-read-timeout را افزایش بده
+502 زیر بار	controller اشباع	kubectl top + HPA روی controller
+🌐 سناریوی ۵: NetworkPolicy — ترافیک بی‌صدا drop می‌شود (Timeout نه Refused)
+علامت
+text
+
+$ curl http://redis-svc:6379
+# بعد از ۳۰ ثانیه: curl: (28) Connection timed out
+
+تمایز حیاتی: Connection refused یعنی چیزی listen نمی‌کند (مشکل Endpoint/پاد). Timeout یعنی بسته‌ها drop می‌شوند — نشانه‌ی NetworkPolicy.
+ریشه فنی
+
+NetworkPolicy در CNI های پشتیبان (Calico, Cilium) با برنامه‌ریزی eBPF یا iptables، بسته‌های ناخواسته را drop می‌کنند (نه reject). نتیجه: کلاینت تا timeout خودش منتظر می‌ماند.
+
+تله‌های رایج:
+
+    Ingress روی مقصد هست ولی Egress روی مبدأ نیست — اگر مبدأ NetworkPolicy egress داشته باشد، ترافیک در مبدأ drop می‌شود.
+
+    Label selector typo — یک حرف بزرگ/کوچک اشتباه، policy را بی‌اثر یا بیش‌ازحد سخت‌گیر می‌کند.
+
+    default-deny اضافه شده بدون allow rule — رایج‌ترین علت.
+
+    CNI از NetworkPolicy پشتیبانی نمی‌کند — Flannel به‌تنهایی policy را اجرا نمی‌کند؛ باید Calico/Cilium باشد.
+
+مسیر排查
+bash
+
+# ۱. policy های namespace مقصد
+kubectl get networkpolicies -n <dst-ns>
+kubectl describe networkpolicy <name> -n <dst-ns>
+
+# ۲. label کلاینت را با from selector مقایسه کن
+kubectl get pod <client-pod> -n <client-ns> --show-labels
+
+# ۳. policy های egress در namespace مبدأ
+kubectl get networkpolicies -n <client-ns> -o yaml | grep -A5 "Egress"
+
+# ۴. تست مستقیم به IP پاد (بدون Service) برای حذف DNS/Service از معادله
+kubectl exec -it <client-pod> -- curl -v http://<dst-pod-ip>:<port>
+# اگر به IP هم timeout → NetworkPolicy قطعاً دخیل است
+
+# ۵. (Cilium) بررسی drop reason
+kubectl exec -n kube-system <cilium-pod> -- cilium-dbg monitor --type drop
+
+رفع
+علت	راه‌حل
+from selector کلاینت را ندارد	label کلاینت را به from.podSelector اضافه کن
+Egress روی مبدأ مانع است	قاعده‌ی egress allow برای مقصد اضافه کن
+default-deny بدون allow	allow rule مناسب اضافه کن
+CNI بدون پشتیبانی	Calico یا Cilium نصب کن
+بخش دوم: خطاهای ذخیره‌سازی (Storage)
+💾 سناریوی ۶: PVC در حالت Pending می‌ماند
+علامت
+text
+
+$ kubectl get pvc
+NAME      STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS
+data      Pending
+
+ریشه فنی
+
+PVC از سه لایه می‌تواند fail شود: StorageClass (وجود/تطابق)، Provisioner (CSI controller)، و Topology/سازگاری.
+
+مهم‌ترین تفکیک: Immediate vs WaitForFirstConsumer
+BindingMode	رفتار
+Immediate	PV همان لحظه‌ی ساخت PVC ساخته می‌شود — بدون توجه به محدودیت‌های topology نود
+WaitForFirstConsumer	PV فقط پس از زمان‌بندی پاد ساخته می‌شود تا provisioner بداند volume را در کدام zone/node بسازد
+
+بنابراین در WaitForFirstConsumer، Pending تا زمانی که هیچ پادی از PVC استفاده نکند، حالت طبیعی و مورد انتظار است. اشتباه رایج: اپراتور PVC را Pending می‌بیند و بیهوده دنبال باگ می‌گردد.
+
+علت‌های Pending واقعی (غیرطبیعی):
+
+    StorageClass وجود ندارد یا نام اشتباه است.
+
+    CSI provisioner Pod در kube-system نیست / CrashLoop است.
+
+    storageClassName: "" صریحاً dynamic provisioning را غیرفعال کرده و منتظر PV دستی است.
+
+    ResourceQuota روی PVC count یا storage از حد گذشته.
+
+    topology constraint: PV در zone ای است که با node affinity پاد نمی‌خواند.
+
+مسیر排查
+bash
+
+# ۱. وضعیت و event های PVC
+kubectl describe pvc <pvc> -n <ns>
+# دنبال این event ها بگرد:
+#   "storageclass.storage.k8s.io \"X\" not found"
+#   "waiting for first consumer to be created before binding"
+#   "no persistent volumes available ... and no storage class is set"
+#   "did not sync pvc ... does not match selector"
+
+# ۲. StorageClass
+kubectl get storageclass
+kubectl get storageclass <name> -o yaml | grep -E "volumeBindingMode|provisioner|allowVolumeExpansion"
+
+# ۳. CSI provisioner
+kubectl get pods -n kube-system | grep csi
+kubectl logs -n kube-system <csi-controller-pod> --tail=50
+
+# ۴. اگر PV ساخته شده اما Bind نشده
+kubectl get pv
+kubectl describe pv <pv> | grep -A10 "Node Affinity"
+
+رفع
+علت	راه‌حل
+WaitForFirstConsumer طبیعی	یک پاد با این PVC بساز تا زمان‌بندی شود و PV ساخته شود
+StorageClass ناموجود	نام را اصلاح کن یا kubectl apply کلاس کن
+CSI provisioner absent	kubectl get pods -n kube-system → نصب/restart CSI
+Topology mismatch	پاد را با nodeSelector/affinity به zone درست بفرست، یا کلاس Immediate با topology مناسب انتخاب کن
+Quota	kubectl describe resourcequota -n <ns>
+
+🔧 تله‌ی عملیاتی بزرگ — nodeName + WaitForFirstConsumer: اگر در Pod spec از spec.nodeName استفاده کنی، scheduler bypass می‌شود و از آنجا که provisioner منتظر تصمیم scheduler است، PVC برای همیشه Pending می‌ماند. راه‌حل صحیح: nodeSelector: kubernetes.io/hostname: <node>.
+💾 سناریوی ۷: Multi-Attach Error — Volume به نود دیگری چسبیده است
+علامت
+text
+
+Warning  FailedAttachVolume  attachdetach-controller
+Multi-Attach error for volume "pvc-xxxx":
+Volume is already exclusively attached to one node and can't be attached to another
+
+پاد در ContainerCreating گیر می‌کند.
+ریشه فنی
+
+Volume های ReadWriteOnce (RWO) — مانند Azure Disk، EBS، vSphere VMDK — فقط به یک نود در هر لحظه قابل attach هستند. وقتی نودی NotReady می‌شود یا کرش می‌کند، پاد به نود دیگری منتقل می‌شود، اما فرآیند detach از نود قدیمی هنوز کامل نشده — در نتیجه attach به نود جدید با Multi-Attach رد می‌شود.
+
+مشکل در لایه‌ی VolumeAttachment است: یک شیء VolumeAttachment نشان می‌دهد volume به نود قدیمی متصل است، و attach-detach controller تا پاک شدن آن، اجازه attach مجدد نمی‌دهد.
+مسیر排查
+bash
+
+# ۱. پاد و event
+kubectl describe pod <pod> | grep -A10 Events
+
+# ۲. VolumeAttachment فعلی
+kubectl get volumeattachment | grep <pv-name>
+# ستون NODE نشان می‌دهد volume به کدام نود attach است
+
+# ۳. وضعیت نود قدیمی
+kubectl get nodes
+# اگر NotReady → منتظر recovery یا حذف نود بمان
+
+# ۴. (اختیاری) لاگ CSI controller
+kubectl logs -n kube-system <csi-controller-pod> | grep -i attach
+
+رفع
+bash
+
+# ⚠️ فقط اگر مطمئنی پاد قدیمی دیگر روی نود قدیمی نمی‌نویسد
+kubectl delete pod <old-pod> --force --grace-period=0
+
+# یا حذف VolumeAttachment قدیمی (با احتیاط — خطر corruption)
+kubectl delete volumeattachment <attachment-name>
+
+# سپس منتظر attach مجدد بمان
+kubectl get pod <pod> -w
+
+راه‌حل بلندمدت: اگر بار کاری نیاز به نوشتن هم‌زمان از چند نود دارد، از volume های ReadWriteMany (RWX) استفاده کن (NFS، Azure Files، CephFS) یا از shared disk با پارامتر maxShares (فقط برای اپ‌هایی که write را هماهنگ می‌کنند).
+
+🔧 خطر داده: --force کردن پاد روی نود کرش‌کرده، اگر نود قدیمی هنوز در حال write باشد، می‌تواند منجر به data corruption شود. ابتدا مطمئن شو نود قدیمی down است یا fencing انجام شده.
+💾 سناریوی ۸: FailedMount — attach موفق اما mount شکست می‌خورد
+علامت
+text
+
+Warning  FailedMount  kubelet
+MountVolume.WaitForAttach failed for volume "pvc-xxxx":
+volumeattachments.storage.k8s.io "csi-xxxx" is forbidden:
+User "system:node:node-02" cannot get resource "volumeattachments" ...
+
+یا MountVolume.SetUp failed با خطای no such file or directory، permission denied، یا GRPC error: code=Internal.
+ریشه فنی
+
+FailedMount یعنی volume به نود attach شده اما kubelet نمی‌تواند آن را در مسیر پاد mount کند. علت‌ها:
+
+    RBAC نود — kubelet با هویت system:node:<name> باید به volumeattachments دسترسی داشته باشد. اگر Node Authorizer این را رد کند، mount شکست می‌خورد.
+
+    فایل tracking گمشده — در درایورهایی مثل Trident، فایل tracking در /var/lib/trident/tracking/ روی نود جدید وجود ندارد.
+
+    مشکل فایل‌سیستم — نیاز به fsck یا permission در سطح host.
+
+    CSI node plugin روی نود — DaemonSet مربوطه CrashLoop است.
+
+مسیر排查
+bash
+
+# ۱. event های دقیق
+kubectl describe pod <pod> | grep -A20 Events
+
+# ۲. CSI node plugin روی نود
+kubectl get pods -n kube-system -o wide | grep csi | grep <node>
+
+# ۳. لاگ node plugin
+kubectl logs -n kube-system <csi-node-pod> --tail=100
+
+# ۴. روی نود — مسیر mount و state درایور
+sudo ls /var/lib/kubelet/plugins/<csi-driver>/
+sudo ls /var/lib/trident/tracking/   # اگر Trident
+
+# ۵. آیا VolumeAttachment درست است؟
+kubectl get volumeattachment <name> -o yaml
+
+رفع
+علت	راه‌حل
+RBAC	نقش system:node را بررسی کن؛ معمولاً Node Authorizer خودکار است اما با تغییرات سفارشی می‌شکند
+tracking file گمشده	در Trident، فایل tracking را از نود قدیمی بازیابی کن یا volume را recreate کن
+CSI node plugin fail	kubectl logs → restart DaemonSet
+filesystem corrupt	روی نود fsck دستی (خارج از Kubernetes)
+💾 سناریوی ۹: PVC در حالت Terminating گیر کرده است
+علامت
+text
+
+$ kubectl get pvc
+NAME   STATUS        VOLUME
+data   Terminating   pvc-xxxx
+
+ریشه فنی
+
+PVC یک finalizer به نام kubernetes.io/pvc-protection دارد. این finalizer تا زمانی که هیچ پادی از PVC استفاده نکند، حذف نمی‌شود. اگر پادی در وضعیت Terminating گیر کرده باشد (مثلاً به دلیل --force نکردن یا finalizer دیگر)، PVC هم برای همیشه Terminating می‌ماند.
+
+تله‌ی Rolling Update: اگر در حین rolling update همزمان PVC را حذف کنی، در حالی که پاد قدیمی هنوز Terminating است، finalizer آزاد نمی‌شود و PVC گیر می‌کند.
+مسیر排查
+bash
+
+# ۱. چه کسی از PVC استفاده می‌کند؟
+kubectl get pods -A -o json | jq '.items[] | select(.spec.volumes[]?.persistentVolumeClaim.claimName=="data") | .metadata.name'
+
+# ۲. finalizer ها
+kubectl get pvc <pvc> -o yaml | grep -A5 finalizers
+
+# ۳. آیا پاد Terminating گیر کرده؟
+kubectl get pods -A | grep Terminating
+
+رفع
+bash
+
+# ابتدا پادهای مصرف‌کننده را حذف کن (و مطمئن شو واقعاً حذف شده‌اند)
+kubectl delete pod <pod>
+
+# اگر پاد گیر کرده:
+kubectl delete pod <pod> --force --grace-period=0
+
+# اگر PVC همچنان Terminating است (آخرین راه‌حل):
+kubectl patch pvc <pvc> -p '{"metadata":{"finalizers":null}}'
+
+🔧 نکته: حذف finalizer را به‌عنوان آخرین راه‌حل در نظر بگیر؛ اگر پاد هنوز واقعاً در حال استفاده باشد، ممکن است منجر به وضعیت ناسازگار شود.
+💾 سناریوی ۱۰: Volume Expansion گیر کرده یا fail می‌شود
+علامت
+text
+
+$ kubectl describe pvc <pvc>
+Conditions:
+  Type: FileSystemResizePending
+
+یا خطای external resizer is not running / allowVolumeExpansion is false.
+ریشه فنی
+
+فرآیند expansion سه مرحله دارد:
+
+    StorageClass باید allowVolumeExpansion: true داشته باشد؛ در غیر این صورت API درخواست را رد می‌کند.
+
+    CSI external-resizer باید volume بک‌اند را بزرگ کند.
+
+    فایل‌سیستم باید resize شود. در برخی درایورها این مرحله نیاز به restart پاد دارد — در این حالت FileSystemResizePending ظاهر می‌شود.
+
+مسیر排查
+bash
+
+# ۱. StorageClass اجازه expansion می‌دهد؟
+kubectl get storageclass <name> -o jsonpath='{.allowVolumeExpansion}'
+
+# ۲. CSI resizer
+kubectl get pods -n kube-system | grep -E "csi-.*resizer|csi-.*controller"
+kubectl logs -n kube-system <csi-controller> --tail=50 | grep -i resize
+
+# ۳. وضعیت PVC
+kubectl describe pvc <pvc> | grep -A5 Conditions
+
+رفع
+علت	راه‌حل
+allowVolumeExpansion: false	StorageClass را patch کن: allowVolumeExpansion: true
+FileSystemResizePending	پاد را restart کن تا فایل‌سیستم resize شود
+CSI resizer absent	درایور CSI را نصب/restart کن
+FilesystemResizeUnsupported	درایور از resize فایل‌سیستم پشتیبانی نمی‌کند → migration به درایور دیگر
+🎯 جمع‌بندی: درخت تصمیم‌گیری عملیاتی
+text
+
+شبکه
+│
+├─ نام resolve نمی‌شود؟
+│   ├─ داخلی → CoreDNS / resolv.conf / NetworkPolicy egress 53
+│   └─ خارجی → upstream resolver نود / ndots / egress 53
+│
+├─ Connection refused؟
+│   ├─ EndpointSlice خالی → selector / readiness
+│   └─ targetPort اشتباه (Ingress)
+│
+├─ Connection timed out؟
+│   ├─ NetworkPolicy (بررسی from/egress)
+│   └─ MTU mismatch (پینگ OK، HTTP hang)
+│
+└─ پاد ContainerCreating + نود Ready؟
+    ├─ CNI DaemonSet روی نود
+    └─ /etc/cni/net.d/ + کانفیگ version
+
+ذخیره‌سازی
+│
+├─ PVC Pending؟
+│   ├─ WaitForFirstConsumer → طبیعی (پاد بساز)
+│   ├─ StorageClass ناموجود / CSI absent
+│   └─ nodeName در Pod (scheduler bypass) → nodeSelector
+│
+├─ Multi-Attach؟
+│   ├─ نود قدیمی NotReady → detach کامل نشده
+│   └─ RWO در ذاتاً multi-node نمی‌شود → RWX
+│
+├─ FailedMount (attach OK، mount نه)؟
+│   ├─ RBAC system:node → volumeattachments
+│   ├─ tracking file گمشده (Trident)
+│   └─ CSI node plugin
+│
+├─ PVC Terminating؟
+│   ├─ پاد مصرف‌کننده گیر کرده → حذف پاد
+│   └─ finalizer pvc-protection → patch نهایی
+│
+└─ Expansion fail؟
+    ├─ allowVolumeExpansion false
+    └─ FileSystemResizePending → restart پاد
+
+قانون طلایی شبکه: همیشه describe pod + get endpointslices را قبل از هر چیز اجرا کن؛ ۸۰٪ خطاهای شبکه از selector/readiness یا CNI نود می‌آید.
+
+قانون طلایی ذخیره‌سازی: قبل از هر اقدامی kubectl describe pvc و kubectl get volumeattachment را ببین؛ تشخیص Pending طبیعی (WaitForFirstConsumer) از Pending بیماری، کلید صرفه‌جویی در زمان است.

@@ -1,0 +1,370 @@
+﻿🌳 درخت دستورات kubectl (ساختار دایرکتوری)
+text
+
+kubectl/
+│
+├── 01-cluster/                    ← مدیریت کلاستر
+│   ├── cluster-info
+│   ├── version
+│   ├── api-resources
+│   ├── api-versions
+│   └── top/
+│
+├── 02-config/                     ← کانتکست و تنظیمات
+│   ├── config-view
+│   ├── config-use-context
+│   ├── config-set-context
+│   ├── config-set-namespace
+│   └── config-rename-context
+│
+├── 03-namespace/                  ← نیم‌اسپیس‌ها
+│   ├── get
+│   ├── create
+│   ├── describe
+│   └── delete
+│
+├── 04-nodes/                      ← نودها
+│   ├── get
+│   ├── describe
+│   ├── cordon
+│   ├── uncordon
+│   ├── drain
+│   ├── taint
+│   └── label
+│
+├── 05-pods/                       ← پادها
+│   ├── get
+│   ├── describe
+│   ├── logs
+│   ├── exec
+│   ├── cp
+│   ├── port-forward
+│   ├── attach
+│   ├── delete
+│   └── wait
+│
+├── 06-workloads/                  ← بارهای کاری
+│   ├── deployment/
+│   │   ├── create
+│   │   ├── get
+│   │   ├── scale
+│   │   ├── rollout-status
+│   │   ├── rollout-history
+│   │   ├── rollout-undo
+│   │   ├── rollout-restart
+│   │   ├── set-image
+│   │   └── autoscale
+│   ├── replicaset/
+│   ├── statefulset/
+│   ├── daemonset/
+│   └── job/
+│       ├── create
+│       └── cronjob/
+│
+├── 07-networking/                 ← شبکه
+│   ├── service/
+│   │   ├── get
+│   │   ├── expose
+│   │   ├── describe
+│   │   └── delete
+│   ├── ingress/
+│   ├── endpoints/
+│   └── networkpolicy/
+│
+├── 08-storage/                    ← ذخیره‌سازی
+│   ├── pv/
+│   ├── pvc/
+│   ├── storageclass/
+│   └── volume/
+│
+├── 09-config-resources/           ← منابع تنظیمات
+│   ├── configmap/
+│   ├── secret/
+│   └── resourcequota/
+│
+├── 10-rbac/                       ← کنترل دسترسی
+│   ├── role/
+│   ├── rolebinding/
+│   ├── clusterrole/
+│   ├── clusterrolebinding/
+│   ├── serviceaccount/
+│   └── auth-can-i
+│
+├── 11-apply/                      ← اعمال و ویرایش منابع
+│   ├── apply
+│   ├── create
+│   ├── replace
+│   ├── patch
+│   ├── edit
+│   ├── delete
+│   ├── label
+│   ├── annotate
+│   └── diff
+│
+├── 12-debug/                      ← دیباگ و عیب‌یابی
+│   ├── describe
+│   ├── logs
+│   ├── exec
+│   ├── events
+│   ├── debug
+│   └── top
+│
+└── 13-output/                     ← خروجی و فرمت
+    ├── -o wide
+    ├── -o yaml
+    ├── -o json
+    ├── -o jsonpath
+    ├── -o custom-columns
+    └── -o name
+
+📁 01-cluster — مدیریت کلاستر
+دستور	توضیح
+kubectl cluster-info	نمایش آدرس‌های API Server و DNS
+kubectl version --short	نسخه kubectl و سرور
+kubectl api-resources	لیست تمام منابع قابل استفاده با kind آن‌ها
+kubectl api-versions	نسخه‌های API فعال (مثل apps/v1)
+kubectl top nodes	مصرف منابع نودها (نیازمند metrics-server)
+
+مثال:
+bash
+
+kubectl cluster-info
+kubectl api-resources --namespaced=false   # منابع غیرنیم‌اسپیس‌ای
+
+🔧 نکته فنی: api-resources ابزار اصلی برای فهمیدن اینکه در محیط بسته (RBAC) به چه resource هایی دسترسی داری و آیا kind در namespace هست یا نه.
+📁 02-config — مدیریت کانتکست‌ها
+دستور	توضیح
+kubectl config view	نمایش کامل kubeconfig
+kubectl config get-contexts	لیست کانتکست‌ها
+kubectl config use-context NAME	جابه‌جایی بین کلاسترها
+kubectl config set-context --current --namespace=dev	تعیین نیم‌اسپیس پیش‌فرض
+kubectl config rename-context	تغییر نام کانتکست
+
+مثال:
+bash
+
+kubectl config get-contexts
+kubectl config use-context prod-admin
+kubectl config set-context --current --namespace=backend
+
+🔧 نکته فنی: --current روی کانتکست فعال کار می‌کند؛ این تنظیم در فایل ~/.kube/config ذخیره می‌شود و از همه دستورات بعدی حذف نیم‌اسپیس صرف‌نظر می‌شود.
+📁 03-namespace
+bash
+
+kubectl get namespaces
+kubectl create namespace dev
+kubectl describe ns dev
+kubectl delete ns dev
+
+🔧 نکته فنی: حذف نیم‌اسپیس با Terminating گیر می‌کند اگر finalizer داشته باشد؛ در محیط واقعی ابتدا منابع داخل آن را پاک کن.
+📁 04-nodes
+دستور	کاربرد
+kubectl get nodes -o wide	آدرس IP، OS، kernel
+kubectl describe node NODE	ظرفیت، allocatable، تaints، pressures
+kubectl cordon NODE	علامت Unschedulable
+kubectl drain NODE --ignore-daemonsets --delete-emptydir-data	تخلیه نود برای نگهداری
+kubectl uncordon NODE	بازگرداندن
+kubectl taint node NODE key=value:NoSchedule	ایجاد taint
+kubectl label node NODE disk=ssd	برچسب‌گذاری
+
+مثال:
+bash
+
+kubectl drain node-1 --ignore-daemonsets --delete-emptydir-data --force
+kubectl taint nodes gpu-1 nvidia.com/gpu=present:NoSchedule
+
+🔧 نکته فنی: drain بدون --delete-emptydir-data اگر پاد با emptyDir باشد خطا می‌دهد؛ این یعنی داده موقت آن پاد از بین می‌رود.
+📁 05-pods
+دستور	کاربرد
+kubectl get pods -o wide	IP، نود، وضعیت
+kubectl describe pod POD	Events، کانتینرها، probes
+kubectl logs POD -f --tail=100	لاگ زنده
+kubectl logs POD -c CONTAINER --previous	لاگ کانتینر کرش‌کرده
+kubectl exec -it POD -- /bin/sh	ورود به کانتینر
+kubectl cp POD:/path/file ./local	کپی فایل
+kubectl port-forward POD 8080:80	تونل محلی
+kubectl delete pod POD --grace-period=0 --force	حذف اجباری
+
+مثال:
+bash
+
+kubectl get pods -n prod -l app=api
+kubectl logs -f deploy/api --tail=50
+kubectl exec -it api-7f8c9 -- sh
+kubectl port-forward svc/api 8080:80
+
+🔧 نکته فنی: kubectl logs deploy/api فقط لاگ یک پاد را می‌دهد؛ برای همه از kubectl logs -l app=api --prefix -f استفاده کن.
+📁 06-workloads
+🗂 Deployment
+bash
+
+kubectl create deploy nginx --image=nginx:1.25 --replicas=3
+kubectl get deploy
+kubectl scale deploy nginx --replicas=5
+kubectl rollout status deploy/nginx
+kubectl rollout history deploy/nginx --revision=2
+kubectl rollout undo deploy/nginx --to-revision=1
+kubectl rollout restart deploy/nginx
+kubectl set image deploy/nginx nginx=nginx:1.26
+kubectl autoscale deploy nginx --min=2 --max=10 --cpu-percent=70
+
+🔧 نکته فنی: set image و rollout restart هر دو یک revision جدید با annotation kubernetes.io/change-cause (اگر --record استفاده شود) می‌سازند؛ برای تغییرات تک‌فایلی kubectl set image بهترین گزینه است.
+🗂 Job / CronJob
+bash
+
+kubectl create job backup --image=busybox -- echo "done"
+kubectl create cronjob backup --image=busybox --schedule="*/5 * * * *" -- /bin/sh -c 'date'
+
+🔧 نکته فنی: برای Job اگر backoffLimit بگذرد پاد Terminating می‌شود؛ برای cleanup خودکار ttlSecondsAfterFinished اضافه کن.
+🗂 StatefulSet / DaemonSet
+bash
+
+kubectl get sts
+kubectl rollout status sts/db
+kubectl get ds -A
+
+🔧 نکته فنی: StatefulSet نیاز به serviceName و volumeClaimTemplates دارد و ترتیب پادها را کنترل می‌کند (برخلاف Deployment که موازی است).
+📁 07-networking
+🗂 Service
+bash
+
+kubectl expose deploy nginx --port=80 --target-port=80 --type=ClusterIP
+kubectl expose deploy nginx --port=443 --type=LoadBalancer
+kubectl get svc
+kubectl describe svc nginx
+kubectl get endpoints nginx
+
+🔧 نکته فنی: اگر endpoints خالی باشد یعنی selector سرویس به هیچ پاد Running/Ready‌ای نمی‌خورد — اولین چک برای سرویس‌های کارنکرده.
+🗂 Ingress
+bash
+
+kubectl get ingress -A
+kubectl describe ingress web
+
+🗂 NetworkPolicy
+bash
+
+kubectl get netpol -A
+
+📁 08-storage
+bash
+
+kubectl get pv
+kubectl get pvc -A
+kubectl get storageclass
+kubectl describe pvc data-claim
+
+🔧 نکته فنی: PV با persistentVolumeReclaimPolicy: Retain بعد از حذف PVC اطلاعات را نگه می‌دارد؛ پیش‌فرض Delete است که خطرناک است.
+📁 09-config-resources
+🗂 ConfigMap
+bash
+
+kubectl create configmap app-config --from-literal=KEY=val --from-file=./config.yaml
+kubectl get cm app-config -o yaml
+kubectl edit cm app-config
+
+🗂 Secret
+bash
+
+kubectl create secret generic db-pass --from-literal=password=s3cr3t
+kubectl create secret docker-registry regcred --docker-server=... --docker-username=... --docker-password=...
+kubectl get secret db-pass -o jsonpath='{.data.password}' | base64 -d
+
+🔧 نکته فنی: Secrets به‌صورت base64 هستند نه رمزنگاری‌شده! در محیط واقعی از encryption at rest + KMS/External Secrets استفاده کن.
+📁 10-rbac
+bash
+
+kubectl create serviceaccount ci-bot
+kubectl create role pod-reader --verb=get,list,watch --resource=pods
+kubectl create rolebinding pod-reader-bind --role=pod-reader --serviceaccount=default:ci-bot
+kubectl auth can-i list pods --as=system:serviceaccount:default:ci-bot
+kubectl auth can-i '*' '*' --all-namespaces
+
+مثال:
+bash
+
+kubectl auth can-i delete deployments -n prod
+# yes / no
+
+🔧 نکته فنی: auth can-i با --as برای تست دقیق SA/User قبل از دیپلوی نقش‌ها ضروری است.
+📁 11-apply — اعمال و ویرایش
+دستور	کاربرد
+kubectl apply -f manifest.yaml	ایجاد/به‌روزرسانی (declarative)
+kubectl apply -f ./dir/	همه فایل‌های یک دایرکتوری
+kubectl apply -k ./overlays/prod	Kustomize
+kubectl create -f ...	فقط ایجاد (imperative)
+kubectl replace -f ...	جایگزینی کامل
+kubectl patch deploy nginx -p '{"spec":{"replicas":5}}'	پچ JSON
+kubectl patch deploy nginx --type=merge -p '...'	پچ merge
+kubectl edit deploy nginx	ویرایش درجا
+kubectl delete -f ...	حذف
+kubectl label pod p app=api	برچسب
+kubectl annotate pod p owner=team-x	annotate
+kubectl diff -f manifest.yaml	نمایش تغییرات قبل از apply
+
+مثال:
+bash
+
+kubectl apply -f manifests/
+kubectl diff -f manifests/        # چک قبل از اعمال
+kubectl patch deploy nginx -p '{"spec":{"replicas":3}}'
+
+🔧 نکته فنی: kubectl apply از annotation kubectl.kubernetes.io/last-applied-configuration برای سه‌طرفه‌ای‌کردن diff استفاده می‌کند؛ replace این را حذف می‌کند و می‌تواند ناخواسته فیلدها را پاک کند.
+📁 12-debug — عیب‌یابی
+bash
+
+kubectl describe pod P
+kubectl get events --sort-by=.lastTimestamp -A
+kubectl logs P --previous
+kubectl debug -it P --image=busybox --target=app
+kubectl run tmp --rm -it --image=busybox --restart=Never -- sh
+kubectl top pods -A
+
+مثال:
+bash
+
+kubectl get events -A --sort-by=.metadata.creationTimestamp | tail -20
+kubectl debug node/node-1 -it --image=busybox
+
+🔧 نکته فنی: kubectl debug --target یک ephemeral container به پاد اضافه می‌کند که در kubectl get pods دیده نمی‌شود اما در describe هست؛ برای دیباگ ایمیج‌های distroless ضروری است.
+📁 13-output — فرمت خروجی
+bash
+
+kubectl get pods -o wide
+kubectl get pods -o yaml
+kubectl get pod P -o json
+kubectl get pods -o name
+kubectl get pods -o custom-columns=NAME:.metadata.name,IP:.status.podIP
+kubectl get pods -o jsonpath='{.items[*].metadata.name}'
+kubectl get pod P -o jsonpath='{.status.containerStatuses[0].restartCount}'
+
+مثال:
+bash
+
+# همه ایمیج‌های در حال اجرا در یک namespace
+kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].image}{"\n"}{end}'
+
+# نودهای NotReady
+kubectl get nodes -o jsonpath='{.items[?(@.status.conditions[?(@.type=="Ready")].status!="True")].metadata.name}'
+
+🔧 نکته فنی: jsonpath سریع‌ترین راه اسکریپت‌نویسی است؛ برای خروجی جدولی سفارشی از custom-columns و برای Query پیچیده از jq روی -o json استفاده کن:
+bash
+
+kubectl get pods -o json | jq '.items[] | select(.status.phase!="Running") | .metadata.name'
+
+🎯 خلاصه نکات فنی کلیدی
+موضوع	نکته
+apply vs create	apply declarative و idempotent است؛ create اگر منبع وجود داشته باشد خطا می‌دهد
+--dry-run=client	برای تست مانیفست بدون اعمال: kubectl apply -f x.yaml --dry-run=client -o yaml
+--field-selector	فیلتر سمت سرور: kubectl get pods --field-selector=status.phase!=Running
+-l label	فیلتر سمت سرور با selector: kubectl get pods -l 'app in (api,web)'
+-A	معادل --all-namespaces
+--show-labels	نمایش labelها در خروجی get
+--sort-by	مرتب‌سازی: --sort-by=.status.startTime
+--watch / -w	live update
+kubectl explain	مستندات درون‌کلاستر: kubectl explain pod.spec.containers.livenessProbe
+alias k=kubectl	برای سرعت: alias k=kubectl و complete -F __start_kubectl k
+
+    💡 پیشنهاد مسیر یادگیری: ابتدا 01-cluster و 02-config → سپس 05-pods و 06-workloads → بعد 07-networking و 09-config-resources → در نهایت 10-rbac و 12-debug.
+
+ 

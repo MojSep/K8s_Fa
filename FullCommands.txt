@@ -1,0 +1,978 @@
+﻿🌳 درخت دستورات kubectl
+📁 ۱. دستورات پایه و ایجاد منابع
+
+    kubectl create : ایجاد یک منبع از طریق فایل یا دستور (Imperative).
+
+        مثال: kubectl create deployment nginx --image=nginx:alpine
+
+    kubectl apply : اعمال یا به‌روزرسانی یک منبع از روی فایل YAML (Declarative). این دستور وضعیت مطلوب را با وضعیت فعلی هماهنگ می‌کند.
+
+        مثال: kubectl apply -f deployment.yaml
+
+    kubectl run : اجرای یک ایمیج خاص در کلاستر (معمولاً برای پادهای موقت و تست).
+
+        مثال: kubectl run tmp-shell --rm -it --image=busybox -- sh
+
+    kubectl expose : ایجاد یک سرویس (Service) برای یک منبع (مثل Deployment).
+
+        مثال: kubectl expose deploy nginx --port=80 --target-port=80 --type=NodePort
+
+📁 ۲. مشاهده و بررسی منابع
+
+    kubectl get : نمایش یک یا چند منبع.
+
+        مثال: kubectl get pods -o wide (نمایش پادها با جزئیات بیشتر)
+
+    kubectl describe : نمایش جزئیات کامل یک منبع (شامل Events که برای عیب‌یابی حیاتی است).
+
+        مثال: kubectl describe pod nginx-abc123
+
+    kubectl explain : دریافت مستندات فیلدهای یک منبع از داخل کلاستر.
+
+        مثال: kubectl explain pod.spec.containers
+
+    kubectl api-resources : نمایش تمام انواع منابع API پشتیبانی‌شده توسط سرور.
+
+        مثال: kubectl api-resources --namespaced=false
+
+    kubectl api-versions : نمایش نسخه‌های API فعال در کلاستر (مثل apps/v1).
+
+        مثال: kubectl api-versions | grep apps
+
+📁 ۳. ویرایش، حذف و به‌روزرسانی
+
+    kubectl delete : حذف یک منبع با نام یا فایل.
+
+        مثال: kubectl delete pod nginx-abc123 یا kubectl delete -f deployment.yaml
+
+    kubectl edit : باز کردن منبع در ادیتور برای ویرایش زنده (Live).
+
+        مثال: kubectl edit deployment nginx
+
+    kubectl patch : اعمال تغییرات روی یک منبع به صورت In-place (بدون جایگزینی کامل).
+
+        مثال: kubectl patch deploy nginx -p '{"spec":{"replicas":3}}'
+
+    kubectl replace : جایگزینی کامل یک منبع با فایل جدید (برخلاف apply که تفاوت‌ها را اعمال می‌کند).
+
+        مثال: kubectl replace -f deployment.yaml
+
+    kubectl label : افزودن یا به‌روزرسانی برچسب (Label) روی یک منبع.
+
+        مثال: kubectl label pod nginx-abc123 env=production
+
+    kubectl annotate : افزودن یا به‌روزرسانی حاشیه‌نویسی (Annotation) روی یک منبع.
+
+        مثال: kubectl annotate pod nginx-abc123 owner=team-a
+
+    kubectl diff : نمایش تفاوت‌های بین فایل محلی و منابع زنده در کلاستر (برای پیش‌نمایش قبل از apply).
+
+        مثال: kubectl diff -f deployment.yaml
+
+    kubectl wait : منتظر ماندن برای رسیدن یک منبع به یک وضعیت خاص.
+
+        مثال: kubectl wait --for=condition=Ready pod/nginx-abc123 --timeout=60s
+
+📁 ۴. مدیریت بارهای کاری (Workloads)
+
+    kubectl scale : تغییر تعداد Replicaهای یک Deployment، ReplicaSet یا StatefulSet.
+
+        مثال: kubectl scale deploy nginx --replicas=5
+
+    kubectl autoscale : ایجاد یک Horizontal Pod Autoscaler (HPA).
+
+        مثال: kubectl autoscale deploy nginx --min=2 --max=10 --cpu-percent=70
+
+    kubectl rollout : مدیریت تاریخچه و وضعیت به‌روزرسانی‌ها (Rollouts).
+
+        مثال: kubectl rollout status deploy/nginx (بررسی وضعیت)
+
+        مثال: kubectl rollout undo deploy/nginx (بازگشت به نسخه قبل)
+
+        مثال: kubectl rollout restart deploy/nginx (ری‌استارت بدون تغییر مانیفست)
+
+    kubectl set : تغییر فیلدهای خاص یک منبع (مثل ایمیج یا منابع).
+
+        مثال: kubectl set image deploy/nginx nginx=nginx:1.25
+
+📁 ۵. شبکه و دسترسی
+
+    kubectl port-forward : فوروارد کردن یک پورت محلی به یک پاد یا سرویس (برای تست و دیباگ).
+
+        مثال: kubectl port-forward svc/nginx 8080:80
+
+    kubectl proxy : اجرای یک پروکسی محلی به API Server کوبرنتیز.
+
+        مثال: kubectl proxy --port=8080 (سپس http://localhost:8080/api/v1/namespaces/default/pods)
+
+    kubectl exec : اجرای یک دستور داخل یک کانتینر در حال اجرا.
+
+        مثال: kubectl exec -it nginx-abc123 -- /bin/sh
+
+    kubectl attach : اتصال به یک کانتینر در حال اجرا (مشابه docker attach).
+
+        مثال: kubectl attach nginx-abc123 -c nginx
+
+    kubectl cp : کپی فایل یا دایرکتوری بین سیستم محلی و یک کانتینر.
+
+        مثال: kubectl cp nginx-abc123:/etc/nginx/nginx.conf ./nginx.conf
+
+📁 ۶. عیب‌یابی و لاگ‌ها
+
+    kubectl logs : نمایش لاگ‌های یک کانتینر در پاد.
+
+        مثال: kubectl logs -f nginx-abc123 (دنبال کردن زنده)
+
+        مثال: kubectl logs nginx-abc123 --previous (لاگ کانتینر کرش‌کرده قبلی)
+
+    kubectl events : (یا kubectl get events) نمایش رویدادهای کلاستر که برای دیباگ حیاتی هستند.
+
+        مثال: kubectl get events --sort-by='.lastTimestamp'
+
+    kubectl debug : ایجاد یک کانتینر اشکال‌زدایی (Ephemeral Container) در یک پاد در حال اجرا یا نود.
+
+        مثال: kubectl debug -it nginx-abc123 --image=busybox --target=nginx
+
+    kubectl top : نمایش مصرف منابع (CPU/Memory) نودها یا پادها (نیازمند Metrics Server).
+
+        مثال: kubectl top pods --sort-by=memory
+
+📁 ۷. مدیریت کلاستر و نودها
+
+    kubectl cluster-info : نمایش آدرس API Server و سرویس‌های اصلی کلاستر.
+
+        مثال: kubectl cluster-info
+
+    kubectl version : نمایش نسخه کلاینت و سرور.
+
+        مثال: kubectl version --short
+
+    kubectl cordon : علامت‌گذاری یک نود به عنوان غیرقابل زمان‌بندی (Unschedulable).
+
+        مثال: kubectl cordon node-1
+
+    kubectl uncordon : بازگرداندن نود به حالت قابل زمان‌بندی.
+
+        مثال: kubectl uncordon node-1
+
+    kubectl drain : تخلیه یک نود از پادها (برای تعمیرات). ابتدا آن را cordon می‌کند و سپس پادها را با رعایت PodDisruptionBudget حذف می‌کند.
+
+        مثال: kubectl drain node-1 --ignore-daemonsets --delete-emptydir-data
+
+    kubectl taint : افزودن یا حذف Taint روی یک نود (برای جلوگیری از زمان‌بندی پادهای خاص).
+
+        مثال: kubectl taint nodes gpu-node nvidia.com/gpu=present:NoSchedule
+
+📁 ۸. پیکربندی و امنیت (Context, RBAC, Certificates)
+
+    kubectl config : مدیریت فایل kubeconfig (کانتکست‌ها، کلاینت‌ها، نیم‌اسپیس پیش‌فرض).
+
+        مثال: kubectl config use-context prod-cluster
+
+        مثال: kubectl config set-context --current --namespace=backend
+
+    kubectl auth can-i : بررسی دسترسی یک کاربر یا ServiceAccount به یک عمل خاص (بر اساس RBAC).
+
+        مثال: kubectl auth can-i delete pods --as=system:serviceaccount:default:ci-bot -n prod
+
+    kubectl certificate : تأیید یا رد Certificate Signing Request (CSR).
+
+        مثال: kubectl certificate approve my-csr
+
+    kubectl completion : تولید اسکریپت تکمیل خودکار (Autocomplete) برای شل.
+
+        مثال: source <(kubectl completion bash)
+
+📁 ۹. دستورات پیشرفته و ابزارهای کمکی
+
+    kubectl kustomize : ساخت منابع از یک دایرکتوری Kustomize (بدون اعمال آن‌ها).
+
+        مثال: kubectl kustomize ./overlays/prod
+
+    kubectl convert : تبدیل مانیفست‌ها بین نسخه‌های مختلف API (منسوخ شده در نسخه‌های جدید).
+
+        مثال: kubectl convert -f old-deployment.yaml --output-version apps/v1
+
+💡 نکات فنی کلیدی
+
+    --dry-run=client: برای تست صحت یک مانیفست بدون اعمال آن: kubectl apply -f x.yaml --dry-run=client -o yaml.
+
+    -o jsonpath و -o custom-columns: برای استخراج داده‌های خاص از خروجی get بسیار کاربردی هستند (مثلاً kubectl get pods -o jsonpath='{.items[*].metadata.name}').
+
+    --field-selector: فیلتر کردن سمت سرور بر اساس فیلدهای منبع (مثلاً kubectl get pods --field-selector=status.phase!=Running).
+
+    Alias و Autocomplete: تنظیم alias k=kubectl و فعال‌سازی kubectl completion سرعت کار را به‌شدت افزایش می‌دهد.
+
+ 
+
+    تمام دستورات kubectl (شامل subcommand ها) با توضیح فنی و یک مثال عملی برای هر مورد.
+
+text 
+
+kubectl
+│
+├── 📁 annotate                          [برچسب‌گذاری توصیفی]
+├── 📁 api-resources                     [لیست منابع API]
+├── 📁 api-versions                      [لیست نسخه‌های API]
+├── 📁 apply                             [اعمال Declarative]
+├── 📁 attach                            [اتصال به کانتینر]
+├── 📁 auth                              [احراز هویت و مجوز]
+│   ├── can-i
+│   └── reconcile
+├── 📁 autoscale                         [HPA خودکار]
+├── 📁 certificate                       [مدیریت CSR]
+│   ├── approve
+│   └── deny
+├── 📁 cluster-info                      [اطلاعات کلاستر]
+│   └── dump
+├── 📁 completion                        [Auto-complete شل]
+├── 📁 config                            [مدیریت kubeconfig]
+│   ├── current-context
+│   ├── delete-cluster
+│   ├── delete-context
+│   ├── delete-user
+│   ├── get-clusters
+│   ├── get-contexts
+│   ├── get-users
+│   ├── rename-context
+│   ├── set
+│   ├── set-cluster
+│   ├── set-context
+│   ├── set-credentials
+│   ├── unset
+│   ├── use-context
+│   └── view
+├── 📁 cordon                            [نود غیرقابل زمان‌بندی]
+├── 📁 cp                                [کپی فایل به/از پاد]
+├── 📁 create                            [ایجاد Imperative]
+│   ├── clusterrole
+│   ├── clusterrolebinding
+│   ├── configmap
+│   ├── cronjob
+│   ├── deployment
+│   ├── ingress
+│   ├── job
+│   ├── namespace
+│   ├── poddisruptionbudget
+│   ├── priorityclass
+│   ├── quota
+│   ├── role
+│   ├── rolebinding
+│   ├── secret
+│   │   ├── docker-registry
+│   │   ├── generic
+│   │   └── tls
+│   ├── service
+│   │   ├── clusterip
+│   │   ├── externalname
+│   │   ├── loadbalancer
+│   │   └── nodeport
+│   ├── serviceaccount
+│   └── token
+├── 📁 debug                             [کانتینر دیباگ موقت]
+├── 📁 delete                            [حذف منبع]
+├── 📁 describe                          [جزئیات کامل منبع]
+├── 📁 diff                              [تفاوت قبل از apply]
+├── 📁 drain                             [تخلیه نود]
+├── 📁 edit                              [ویرایش زنده]
+├── 📁 events                            [رویدادهای کلاستر]
+├── 📁 exec                              [اجرای دستور در کانتینر]
+├── 📁 explain                           [مستندات فیلد]
+├── 📁 expose                            [ایجاد Service]
+├── 📁 get                               [لیست منابع]
+├── 📁 kustomize                         [ساخت از Kustomize]
+├── 📁 label                             [برچسب‌گذاری]
+├── 📁 logs                              [لاگ کانتینر]
+├── 📁 options                           [گزینه‌های global]
+├── 📁 patch                             [پچ In-place]
+├── 📁 plugin                            [پلاگین‌ها]
+│   └── list
+├── 📁 port-forward                      [فوروارد پورت محلی]
+├── 📁 proxy                             [پروکسی به API Server]
+├── 📁 replace                           [جایگزینی کامل]
+├── 📁 rollout                           [مدیریت انتشار]
+│   ├── history
+│   ├── pause
+│   ├── restart
+│   ├── resume
+│   ├── status
+│   └── undo
+├── 📁 run                               [اجرای پاد موقت]
+├── 📁 scale                             [تغییر replica]
+├── 📁 set                               [تنظیم فیلدها]
+│   ├── env
+│   ├── image
+│   ├── resources
+│   ├── selector
+│   ├── serviceaccount
+│   └── subject
+├── 📁 taint                             [Taint نود]
+├── 📁 top                               [مصرف منابع]
+│   ├── node
+│   └── pod
+├── 📁 uncordon                          [نود قابل زمان‌بندی]
+├── 📁 version                           [نسخه کلاینت/سرور]
+└── 📁 wait                              [انتظار برای وضعیت]
+
+📁 annotate — افزودن Annotation
+
+توضیح فنی: Annotation = متادیتای key-value برای اطلاعات غیر-انتخابی (مثل owner، commit، docs). برخلاف Label، در selector استفاده نمی‌شود.
+
+مثال:
+bash
+
+kubectl annotate pod nginx-abc123 owner="team-a" git-commit="a1b2c3"
+kubectl annotate pod nginx-abc123 owner-   # حذف
+kubectl annotate -f deploy.yaml --overwrite
+
+📁 api-resources — لیست منابع API
+
+توضیح فنی: منابعی که API Server می‌شناسد. با --namespaced=false منابع کلاستراسکوپ (Node, PV, ClusterRole) را نشان می‌دهد.
+
+مثال:
+bash
+
+kubectl api-resources
+kubectl api-resources --namespaced=false
+kubectl api-resources --verbs=list,get
+
+📁 api-versions — نسخه‌های API
+
+توضیح فنی: نسخه‌های Group/Version فعال (مثل apps/v1، batch/v1).
+
+مثال:
+bash
+
+kubectl api-versions | grep apps
+
+📁 apply — اعمال Declarative
+
+توضیح فنی: سه‌طرفه merge با استفاده از annotation last-applied-configuration. Idempotent است. برای GitOps توصیه می‌شود.
+
+مثال:
+bash
+
+kubectl apply -f deployment.yaml
+kubectl apply -f ./manifests/           # کل دایرکتوری
+kubectl apply -k ./overlays/prod        # Kustomize
+kubectl apply -f x.yaml --dry-run=server   # فقط پیش‌نمایش سمت سرور
+kubectl apply -f x.yaml --prune -l app=api # پاکسازی منابع حذف‌شده
+
+📁 attach — اتصال به کانتینر
+
+توضیح فنی: مثل docker attach — به PID 1 کانتینر وصل می‌شود (برخلاف exec که process جدید می‌سازد).
+
+مثال:
+bash
+
+kubectl attach nginx-abc123 -c nginx
+kubectl attach nginx-abc123 -it
+
+📁 auth — احراز هویت و مجوز
+🔹 auth can-i
+
+توضیح فنی: بررسی RBAC بدون اجرای واقعی. با --as می‌توان کاربر/SA را impersonate کرد.
+
+مثال:
+bash
+
+kubectl auth can-i create pods
+kubectl auth can-i delete '*' --all-namespaces
+kubectl auth can-i list pods --as=system:serviceaccount:default:ci-bot -n prod
+kubectl auth can-i --list   # همه دسترسی‌های کاربر جاری
+
+🔹 auth reconcile
+
+توضیح فنی: همگام‌سازی Role/ClusterRole و binding ها از روی فایل. برای GitOps کاربردی است.
+
+مثال:
+bash
+
+kubectl auth reconcile -f rbac.yaml --remove-extra-permissions
+
+📁 autoscale — ایجاد HPA
+
+توضیح فنی: HorizontalPodAutoscaler بر اساس CPU/Memory یا custom metric. نیازمند Metrics Server.
+
+مثال:
+bash
+
+kubectl autoscale deploy nginx --min=2 --max=10 --cpu-percent=70
+kubectl autoscale deploy nginx --min=2 --max=10 --memory-percent=80
+
+📁 certificate — مدیریت CSR
+🔹 certificate approve
+
+توضیح فنی: تأیید CertificateSigningRequest (kubelet cert renewal، ورود کاربران جدید).
+
+مثال:
+bash
+
+kubectl certificate approve my-csr
+kubectl get csr
+
+🔹 certificate deny
+
+مثال:
+bash
+
+kubectl certificate deny my-csr
+
+📁 cluster-info — اطلاعات کلاستر
+
+توضیح فنی: آدرس‌های control plane (API Server, kube-dns).
+
+مثال:
+bash
+
+kubectl cluster-info
+
+🔹 cluster-info dump
+
+توضیح فنی: دامپ کامل state کلاستر برای troubleshooting. حجم زیاد.
+
+مثال:
+bash
+
+kubectl cluster-info dump --output-directory=/tmp/cluster-dump
+
+📁 completion — Auto-complete
+
+توضیح فنی: اسکریپت Bash/Zsh/Fish/PowerShell. برای سرعت کار حیاتی است.
+
+مثال:
+bash
+
+source <(kubectl completion bash)
+echo "source <(kubectl completion bash)" >> ~/.bashrc
+kubectl completion zsh > "${fpath[1]}/_kubectl"
+
+📁 config — مدیریت kubeconfig
+
+توضیح فنی: kubeconfig یک فایل YAML با clusters, users, contexts است. تغییرات در ~/.kube/config ذخیره می‌شود.
+subcommand	توضیح	مثال
+current-context	نمایش context فعال	kubectl config current-context
+get-contexts	لیست context ها	kubectl config get-contexts
+use-context	تغییر context	kubectl config use-context prod
+set-context	تنظیم context	kubectl config set-context --current --namespace=dev
+set-cluster	تعریف cluster	kubectl config set-cluster prod --server=https://1.2.3.4:6443
+set-credentials	تعریف user	kubectl config set-credentials bob --token=xxx
+rename-context	تغییر نام	kubectl config rename-context old new
+delete-context	حذف context	kubectl config delete-context dev
+delete-cluster	حذف cluster	kubectl config delete-cluster prod
+delete-user	حذف user	kubectl config delete-user bob
+get-clusters	لیست cluster ها	kubectl config get-clusters
+get-users	لیست user ها	kubectl config get-users
+view	نمایش config کامل	kubectl config view --raw
+unset	حذف یک فیلد	kubectl config unset users.bob.token
+set	تنظیم مقدار	kubectl config set current-context prod
+📁 cordon — نود غیرقابل زمان‌بندی
+
+توضیح فنی: spec.unschedulable=true روی Node. پادهای موجود ادامه می‌دهند، جدیدها زمان‌بندی نمی‌شوند.
+
+مثال:
+bash
+
+kubectl cordon node-1
+kubectl get nodes   # وضعیت SchedulingDisabled
+
+📁 cp — کپی فایل
+
+توضیح فنی: مثل scp/docker cp — نیازمند tar در کانتینر مقصد.
+
+مثال:
+bash
+
+kubectl cp nginx-abc123:/etc/nginx/nginx.conf ./nginx.conf
+kubectl cp ./app.jar nginx-abc123:/opt/app.jar
+kubectl cp -c sidecar nginx-abc123:/tmp/log ./log  # انتخاب کانتینر
+
+📁 create — ایجاد Imperative
+
+توضیح فنی: ایجاد مستقیم بدون فایل. برای speed و smoke-test، اما برای production از apply استفاده کن.
+🔹 create deployment
+bash
+
+kubectl create deploy nginx --image=nginx:1.25 --replicas=3
+kubectl create deploy nginx --image=nginx --dry-run=client -o yaml > deploy.yaml
+
+🔹 create namespace
+bash
+
+kubectl create ns dev
+
+🔹 create configmap
+bash
+
+kubectl create cm app-config --from-literal=K1=v1 --from-file=./config.yaml
+kubectl create cm nginx-conf --from-file=nginx.conf
+
+🔹 create secret
+bash
+
+kubectl create secret generic db-pass --from-literal=password=s3cr3t
+kubectl create secret docker-registry regcred \
+  --docker-server=reg.example.com \
+  --docker-username=robot --docker-password=xxx
+kubectl create secret tls my-tls --cert=tls.crt --key=tls.key
+
+🔹 create service
+bash
+
+kubectl create service clusterip my-svc --tcp=80:8080
+kubectl create service nodeport my-svc --tcp=80:8080
+kubectl create service loadbalancer my-svc --tcp=80:8080
+
+🔹 create job / cronjob
+bash
+
+kubectl create job backup --image=busybox -- sh -c 'tar czf /tmp/b.tgz /data'
+kubectl create cronjob backup --image=busybox --schedule="*/5 * * * *" -- date
+
+🔹 create role / rolebinding
+bash
+
+kubectl create role pod-reader --verb=get,list,watch --resource=pods
+kubectl create rolebinding pod-reader-bind --role=pod-reader --user=bob -n dev
+kubectl create clusterrole node-reader --verb=get,list --resource=nodes
+kubectl create clusterrolebinding node-reader-bind --clusterrole=node-reader --group=devs
+
+🔹 create serviceaccount
+bash
+
+kubectl create sa ci-bot -n ci
+
+🔹 create token (K8s 1.24+)
+
+توضیح فنی: جایگزین Secret خودکار SA. Token موقت با TTL می‌سازد.
+bash
+
+kubectl create token ci-bot -n ci --duration=24h
+
+🔹 create quota / poddisruptionbudget / priorityclass / ingress
+bash
+
+kubectl create quota my-quota --hard=cpu=10,memory=20Gi,pods=20
+kubectl create pdb my-pdb --selector=app=api --min-available=2
+kubectl create priorityclass high --value=1000
+kubectl create ingress web --rule="example.com/*=web:80" --class=nginx
+
+📁 debug — کانتینر دیباگ
+
+توضیح فنی: Ephemeral container به پاد اضافه می‌کند (در get pods دیده نمی‌شود، در describe هست). برای ایمیج‌های distroless (بدون shell) حیاتی است.
+
+مثال:
+bash
+
+kubectl debug -it nginx-abc123 --image=busybox --target=nginx
+kubectl debug node/node-1 -it --image=busybox   # دیباگ نود
+kubectl debug -it mypod --image=alpine --copy-to=mypod-debug
+
+📁 delete — حذف منبع
+
+توضیح فنی: پیش‌فرض graceful (با terminationGracePeriodSeconds)؛ --force --grace-period=0 فقط برای پاد گیرکرده.
+
+مثال:
+bash
+
+kubectl delete pod nginx-abc123
+kubectl delete -f deployment.yaml
+kubectl delete pods -l app=nginx
+kubectl delete pods --all -n dev
+kubectl delete pod stuck-pod --grace-period=0 --force
+kubectl delete ns dev --wait=false   # غیرمسدود
+
+📁 describe — جزئیات کامل
+
+توضیح فنی: خروجی human-readable شامل Events (مهم‌ترین بخش برای دیباگ: ImagePullBackOff, FailedScheduling, OOMKilled).
+
+مثال:
+bash
+
+kubectl describe pod nginx-abc123
+kubectl describe node node-1
+kubectl describe svc nginx
+kubectl describe pvc data-claim
+
+📁 diff — تفاوت قبل از apply
+
+توضیح فنی: مقایسه فایل با live state. خروجی مشابه git diff.
+
+مثال:
+bash
+
+kubectl diff -f deployment.yaml
+kubectl diff -k ./overlays/prod
+
+📁 drain — تخلیه نود
+
+توضیح فنی: ابتدا cordon، سپس evict پادها با رعایت PDB. برای maintenance ضروری.
+
+مثال:
+bash
+
+kubectl drain node-1 --ignore-daemonsets --delete-emptydir-data
+kubectl drain node-1 --ignore-daemonsets --delete-emptydir-data --force --timeout=300s
+
+📁 edit — ویرایش زنده
+
+توضیح فنی: باز کردن منبع در $EDITOR. در production خطرناک — از GitOps استفاده کن.
+
+مثال:
+bash
+
+kubectl edit deploy nginx
+KUBE_EDITOR="nano" kubectl edit svc nginx
+
+📁 events — رویدادهای کلاستر
+
+توضیح فنی: kubectl get events که مرتب‌شده و با فیلتر بهتری نمایش می‌دهد (K8s 1.26+).
+
+مثال:
+bash
+
+kubectl events
+kubectl events --for pod/nginx-abc123
+kubectl events -A --types=Warning
+
+📁 exec — اجرای دستور در کانتینر
+
+توضیح فنی: Process جدید در container namespace می‌سازد. -it = interactive+TTY.
+
+مثال:
+bash
+
+kubectl exec -it nginx-abc123 -- /bin/sh
+kubectl exec nginx-abc123 -c sidecar -- ls /tmp
+kubectl exec nginx-abc123 -- env
+kubectl exec deploy/nginx -- date      # اولین پاد deployment
+
+📁 explain — مستندات فیلد
+
+توضیح فنی: مستندات OpenAPI داخل کلاستر — بدون نیاز به اینترنت.
+
+مثال:
+bash
+
+kubectl explain pod.spec.containers
+kubectl explain pod.spec.containers.livenessProbe --recursive
+kubectl explain --api-version=apps/v1 deployment.spec
+
+📁 expose — ایجاد Service
+
+توضیح فنی: shortcut برای ساخت Service از روی workload.
+
+مثال:
+bash
+
+kubectl expose deploy nginx --port=80 --target-port=80 --type=ClusterIP
+kubectl expose deploy nginx --port=443 --target-port=8443 --type=LoadBalancer
+kubectl expose pod nginx-abc123 --port=80 --name=nginx-svc
+kubectl expose deploy nginx --port=80 --dry-run=client -o yaml > svc.yaml
+
+📁 get — لیست منابع
+
+توضیح فنی: پرکاربردترین دستور. با -o فرمت خروجی، با -l فیلتر label، با --field-selector فیلتر فیلد.
+
+مثال:
+bash
+
+kubectl get pods
+kubectl get pods -o wide
+kubectl get pods -A
+kubectl get pods -l app=nginx
+kubectl get pods --field-selector=status.phase!=Running
+kubectl get all -n prod
+kubectl get pod nginx-abc123 -o yaml
+kubectl get pods -o jsonpath='{.items[*].metadata.name}'
+kubectl get pods -o custom-columns=NAME:.metadata.name,IP:.status.podIP
+kubectl get pods -w          # watch live
+kubectl get pods --sort-by=.status.startTime
+kubectl get events --sort-by=.lastTimestamp -A
+
+📁 kustomize — ساخت از Kustomize
+
+توضیح فنی: رندر kustomization.yaml بدون اعمال. برای verify و debug.
+
+مثال:
+bash
+
+kubectl kustomize ./overlays/prod > prod.yaml
+kubectl kustomize ./base | kubectl diff -f -
+
+📁 label — برچسب‌گذاری
+
+توضیح فنی: Label = key-value برای انتخاب (selector). - انتها = حذف.
+
+مثال:
+bash
+
+kubectl label pod nginx-abc123 env=prod
+kubectl label pod nginx-abc123 env-       # حذف
+kubectl label nodes node-1 disk=ssd
+kubectl label pods -l app=nginx version=v2 --overwrite
+
+📁 logs — لاگ کانتینر
+
+توضیح فنی: از kubelet API می‌خواند. --previous برای کانتینر کرش‌کرده.
+
+مثال:
+bash
+
+kubectl logs nginx-abc123
+kubectl logs -f nginx-abc123 --tail=100
+kubectl logs nginx-abc123 -c sidecar
+kubectl logs nginx-abc123 --previous
+kubectl logs -l app=nginx --prefix -f   # همه پادهای یک label
+kubectl logs deploy/nginx --since=10m
+kubectl logs job/backup
+
+📁 options — گزینه‌های global
+
+توضیح فنی: لیست فلگ‌های سراسری (-n، --kubeconfig، -v).
+
+مثال:
+bash
+
+kubectl options
+
+📁 patch — پچ In-place
+
+توضیح فنی: سه نوع: strategic (پیش‌فرض، هوشمند برای merge)، merge (RFC 7386)، json (RFC 6902).
+
+مثال:
+bash
+
+# strategic merge
+kubectl patch deploy nginx -p '{"spec":{"replicas":5}}'
+
+# JSON patch
+kubectl patch deploy nginx --type=json -p='[{"op":"replace","path":"/spec/replicas","value":5}]'
+
+# از فایل
+kubectl patch deploy nginx --patch-file=patch.yaml
+
+📁 plugin — پلاگین‌ها
+
+توضیح فنی: پلاگین‌های kubectl در $PATH با پیشوند kubectl- (مثل kubectl-krew, kubectl-neat).
+
+مثال:
+bash
+
+kubectl plugin list
+
+📁 port-forward — فوروارد پورت
+
+توضیح فنی: تونل محلی → Pod/Service از طریق kubelet. برای دیباگ عالی.
+
+مثال:
+bash
+
+kubectl port-forward pod/nginx-abc123 8080:80
+kubectl port-forward svc/nginx 8080:80
+kubectl port-forward deploy/nginx 8080:80
+kubectl port-forward -n monitoring svc/grafana 3000:3000 --address=0.0.0.0
+
+📁 proxy — پروکسی API Server
+
+توضیح فنی: یک HTTP proxy محلی به API Server. برای curl کردن مستقیم API و dashboard.
+
+مثال:
+bash
+
+kubectl proxy --port=8001
+curl http://localhost:8001/api/v1/namespaces/default/pods
+
+📁 replace — جایگزینی کامل
+
+توضیح فنی: کل منبع را جایگزین می‌کند (نه merge). annotation last-applied را پاک می‌کند — خطرناک اگر بعدش apply بزنی.
+
+مثال:
+bash
+
+kubectl replace -f deployment.yaml
+kubectl replace --force -f deployment.yaml  # delete+create
+
+📁 rollout — مدیریت انتشار
+🔹 rollout status
+bash
+
+kubectl rollout status deploy/nginx
+kubectl rollout status sts/db --timeout=5m
+
+🔹 rollout history
+bash
+
+kubectl rollout history deploy/nginx
+kubectl rollout history deploy/nginx --revision=2
+
+🔹 rollout undo
+
+توضیح فنی: برگشت به revision قبلی یا مشخص. با --to-revision=1.
+bash
+
+kubectl rollout undo deploy/nginx
+kubectl rollout undo deploy/nginx --to-revision=1
+
+🔹 rollout restart
+
+توضیح فنی: annotation kubectl.kubernetes.io/restartedAt را عوض می‌کند → rolling restart بدون تغییر مانیفست.
+bash
+
+kubectl rollout restart deploy/nginx
+
+🔹 rollout pause / resume
+
+توضیح فنی: متوقف/ادامه انتشار — برای canary دستی مفید.
+bash
+
+kubectl rollout pause deploy/nginx
+kubectl set image deploy/nginx nginx=nginx:1.26
+kubectl rollout resume deploy/nginx
+
+📁 run — اجرای پاد موقت
+
+توضیح فنی: برای smoke test و debug. --rm = حذف پس از exit.
+
+مثال:
+bash
+
+kubectl run tmp --rm -it --image=busybox --restart=Never -- sh
+kubectl run nginx --image=nginx --port=80
+kubectl run test --image=curlimages/curl --restart=Never -- curl http://svc
+
+📁 scale — تغییر replica
+
+توضیح فنی: مستقیم spec.replicas را تغییر می‌دهد. در GitOps باعث drift می‌شود — مراقب باش.
+
+مثال:
+bash
+
+kubectl scale deploy nginx --replicas=5
+kubectl scale --current-replicas=3 --replicas=10 deploy/nginx
+kubectl scale sts/db --replicas=3
+
+📁 set — تنظیم فیلدها
+🔹 set image
+bash
+
+kubectl set image deploy/nginx nginx=nginx:1.26
+kubectl set image deploy/nginx '*'=nginx:1.26   # همه کانتینرها
+
+🔹 set env
+bash
+
+kubectl set env deploy/nginx LOG_LEVEL=debug
+kubectl set env deploy/nginx --from=cm/app-config
+kubectl set env deploy/nginx ENV-   # حذف
+
+🔹 set resources
+bash
+
+kubectl set resources deploy/nginx --limits=cpu=500m,memory=512Mi --requests=cpu=100m,memory=128Mi
+
+🔹 set selector
+bash
+
+kubectl set selector svc/nginx 'app=web'
+
+🔹 set serviceaccount
+bash
+
+kubectl set serviceaccount deploy/nginx my-sa
+
+🔹 set subject
+bash
+
+kubectl set subject rolebinding/rb --user=bob
+
+📁 taint — Taint نود
+
+توضیح فنی: Taint = دفع‌کننده؛ Pod با Toleration سازگار روی نود زمان‌بندی می‌شود.
+
+مثال:
+bash
+
+kubectl taint nodes gpu-1 nvidia.com/gpu=present:NoSchedule
+kubectl taint nodes node-1 env=prod:NoExecute
+kubectl taint nodes node-1 env-    # حذف
+
+📁 top — مصرف منابع
+
+توضیح فنی: نیازمند Metrics Server. برای HPA و capacity planning.
+
+مثال:
+bash
+
+kubectl top node
+kubectl top pod
+kubectl top pod -A --sort-by=memory
+kubectl top pod --containers
+
+📁 uncordon — نود قابل زمان‌بندی
+
+مثال:
+bash
+
+kubectl uncordon node-1
+
+📁 version — نسخه
+
+مثال:
+bash
+
+kubectl version
+kubectl version --short
+kubectl version -o yaml
+
+📁 wait — انتظار برای وضعیت
+
+توضیح فنی: در CI/CD کاربردی — تا Pod Ready شدن یا PVC Bound شدن صبر کن.
+
+مثال:
+bash
+
+kubectl wait --for=condition=Ready pod/nginx-abc123 --timeout=60s
+kubectl wait --for=condition=Available deploy/nginx --timeout=300s
+kubectl wait --for=delete pod/old-pod --timeout=60s
+kubectl wait --for=jsonpath='{.status.phase}'=Running pod/mypod
+
+🎯 جدول سریع — کدام دستور برای چه کاری؟
+کار	دستور
+مشاهده سریع	get
+دیباگ عمیق	describe
+لاگ	logs
+ورود به پاد	exec
+اعمال مانیفست	apply
+اعتبارسنجی بدون اعمال	diff + --dry-run
+Rollback	rollout undo
+Restart	rollout restart
+مقیاس	scale یا autoscale
+فوروارد پورت	port-forward
+دیباگ ایمیج distroless	debug
+چک دسترسی	auth can-i
+نود maintenance	cordon → drain → uncordon
+مستندات فیلد	explain
+اتوماسیون CI	wait
+💡 نکات سراسری کاربردی
+bash
+
+# Alias پیشنهادی
+alias k=kubectl
+alias kgp='kubectl get pods'
+alias kgpa='kubectl get pods -A'
+alias kgs='kubectl get svc'
+alias kd='kubectl describe'
+alias kl='kubectl logs -f'
+complete -F __start_kubectl k
+
+# فلگ‌های سراسری مهم
+-n <ns>                 # namespace
+-A                      # همه namespace ها
+--context=<name>        # context خاص
+--kubeconfig=<path>     # فایل kubeconfig
+-o <format>             # yaml/json/wide/jsonpath/custom-columns
+--dry-run=client|server # پیش‌نمایش
+-v=<level>              # لاگ دیباگ kubectl (مثلاً -v=9)
+--request-timeout=30s   # timeout
+ 

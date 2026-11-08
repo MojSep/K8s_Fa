@@ -1,0 +1,351 @@
+﻿🎯 Best Practice: Terraform vs kubectl vs Python برای مدیریت Kubernetes
+📊 مقایسه کلی
+معیار	Terraform	kubectl/YAML	Python (kubernetes-client)
+پارادایم	Declarative	Declarative	Imperative
+مدیریت State	✅ دارد (tfstate)	❌ ندارد	❌ ندارد
+مناسب برای	زیرساخت کلاستر	منابع داخل کلاستر	اتوماسیون سفارشی
+GitOps-friendly	نسبی	✅ عالی	❌ ضعیف
+Drift Detection	✅ خودکار	⚠️ با ArgoCD/Flux	❌ ندارد
+پیچیدگی یادگیری	متوسط	کم	متوسط
+مناسب تیم DevOps	✅	✅	⚠️ فقط برای موارد خاص
+مناسب برنامه‌نویس	❌	⚠️	✅
+🏗️ معماری توصیه‌شده (Layered Best Practice)
+text
+
+┌─────────────────────────────────────────────────────────┐
+│  Layer 4: Application Workloads                         │
+│  → GitOps (ArgoCD / Flux) + Helm / Kustomize            │
+│  → manifests در Git، apply خودکار                       │
+├─────────────────────────────────────────────────────────┤
+│  Layer 3: Cluster Add-ons                               │
+│  → Terraform (helm provider) یا ArgoCD                  │
+│  → ingress-nginx, cert-manager, monitoring              │
+├─────────────────────────────────────────────────────────┤
+│  Layer 2: Kubernetes Cluster                            │
+│  → Terraform (EKS/GKE/AKS module)                       │
+│  → VPC, Node Groups, IAM, RBAC اولیه                    │
+├─────────────────────────────────────────────────────────┤
+│  Layer 1: Cloud Infrastructure                          │
+│  → Terraform / Pulumi / Crossplane                      │
+│  → VPC, Subnets, Load Balancers, Databases              │
+└─────────────────────────────────────────────────────────┘
+
+        Python → فقط برای Automation سفارشی و Operators
+        kubectl → فقط برای Debugging و Manual Ops
+
+🟢 1. Terraform — کجا استفاده شود؟
+✅ موارد مناسب
+hcl
+
+# زیرساخت کلاستر (EKS)
+module "eks" {
+  source          = "terraform-aws-modules/eks/aws"
+  version         = "~> 20.0"
+  cluster_name    = "prod-cluster"
+  cluster_version = "1.29"
+  vpc_id          = module.vpc.vpc_id
+  subnet_ids      = module.vpc.private_subnets
+}
+
+# منابع ابری متصل به K8s
+resource "aws_iam_role" "irsa" {
+  name = "app-irsa-role"
+}
+
+# Add-ons داخل کلاستر (با helm provider)
+resource "helm_release" "ingress_nginx" {
+  name       = "ingress-nginx"
+  repository = "https://kubernetes.github.io/ingress-nginx"
+  chart      = "ingress-nginx"
+  namespace  = "ingress-nginx"
+}
+
+✅ بهترین کاربردها
+
+    Provisioning کلاستر (EKS, GKE, AKS, kubeadm)
+
+    VPC، Subnet، Security Group، IAM
+
+    Node Groups و Auto-scaling
+
+    IAM Roles for Service Accounts (IRSA)
+
+    Cluster add-ons (Cert-Manager، Monitoring)
+
+    منابع ابری خارج از K8s (RDS، S3، Secrets Manager)
+
+    Multi-cluster management
+
+❌ ضدالگوها (Anti-patterns)
+hcl
+
+# ❌ هرگز workload اپلیکیشن را با Terraform مدیریت نکن
+resource "kubernetes_deployment" "api" {
+  metadata { name = "api" }
+  spec {
+    replicas = 3
+    # این کار state را شکننده می‌کند
+  }
+}
+
+🔧 دلایل:
+
+    State سنگین — با هر تغییر deployment باید terraform apply بزنی
+
+    تعارض با GitOps — ArgoCD و Terraform هر دو می‌خواهند مالک باشند (Conflict)
+
+    Rollback سخت — kubectl rollout undo سریع‌تر از terraform apply قبلی است
+
+    CI/CD کندتر — Terraform plan/apply برای هر deploy، کند است
+
+    فقدان progressive delivery — Canary، Blue/Green با ArgoCD راحت‌تر است
+
+⚠️ استثنا: در تیم‌های کوچک که زیرساخت و اپ یکی است، kubernetes_* provider قابل قبول است ولی برای Scale-Up مهاجرت به GitOps ضروری می‌شود.
+🟢 2. GitOps (کوبectl + YAML) — استاندارد طلایی Workloads
+✅ Best Practice معماری
+text
+
+GitHub Repo
+   │
+   ├── apps/
+   │   ├── api/
+   │   │   ├── base/           ← Kustomize base
+   │   │   │   ├── deployment.yaml
+   │   │   │   ├── service.yaml
+   │   │   │   └── kustomization.yaml
+   │   │   └── overlays/
+   │   │       ├── staging/
+   │   │       └── prod/
+   │   └── web/
+   │
+   └── infra/
+       └── argocd-apps.yaml
+
+مثال Kustomize
+yaml
+
+# base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+images:
+  - name: api
+    newTag: v1.2.3
+
+# overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - target:
+      kind: Deployment
+      name: api
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 10
+
+ArgoCD Application
+yaml
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/org/k8s-manifests
+    path: apps/api/overlays/prod
+    targetRevision: main
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true    # ← drift خودکار اصلاح می‌شود
+
+✅ چرا این بهترین است؟
+ویژگی	مزیت
+Single Source of Truth	Git = وضعیت واقعی
+Audit Trail	هر تغییر PR دارد و کامیت شده
+Rollback سریع	git revert → ArgoCD خودکار sync
+Drift Detection	selfHeal: true انحراف را اصلاح می‌کند
+Multi-env	overlay‌های Kustomize/Helm values
+تیم-friendly	dev و ops روی یک repo کار می‌کنند
+Security	ArgoCD داخل کلاستر — دسترسی مستقیم به prod لازم نیست
+🛠️ kubectl — فقط برای این موارد
+bash
+
+# ✅ دیباگ و عیب‌یابی
+kubectl describe pod api-xyz
+kubectl logs -f api-xyz
+kubectl exec -it api-xyz -- sh
+kubectl get events --sort-by=.lastTimestamp
+
+# ✅ بررسی وضعیت
+kubectl get all -n prod
+kubectl top pods
+
+# ✅ Manual scaling اضطراری
+kubectl scale deploy/api --replicas=20
+
+# ✅ Drain/Cordon برای maintenance
+kubectl drain node-1 --ignore-daemonsets
+
+bash
+
+# ❌ هرگز در Production به این شکل تغییر نده
+kubectl set image deploy/api api=api:v2.0   # ← drift می‌سازد
+kubectl edit deploy/api                      # ← تغییر ثبت نمی‌شود
+kubectl apply -f manual.yaml                 # ← از local، نه از Git
+
+🟡 3. Python (kubernetes-client) — کجا استفاده شود؟
+
+Python جایگزین Terraform یا GitOps نیست، بلکه برای اتوماسیون‌های سفارشی است.
+✅ موارد مشروع استفاده
+الف) Kubernetes Operators (Custom Controllers)
+python
+
+# کопируй از kopf یا kubernetes-client
+import kopf
+
+@kopf.on.create('myorg.io', 'v1', 'databases')
+def create_db(spec, name, namespace, **kwargs):
+    size = spec.get('size', 'small')
+    # منطق پیچیده provisioning
+    create_statefulset(name, namespace, size)
+    return {'status': 'creating'}
+
+ب) اتوماسیون‌های Cross-cutting
+python
+
+# پاک‌سازی خودکار PVCهای بدون استفاده
+from kubernetes import client, config
+
+config.load_incluster_config()
+v1 = client.CoreV1Api()
+
+pvcs = v1.list_persistent_volume_claim_for_all_namespaces()
+for pvc in pvcs.items:
+    if pvc.status.phase == "Pending" and is_old(pvc):
+        v1.delete_namespaced_persistent_volume_claim(
+            pvc.metadata.name, pvc.metadata.namespace
+        )
+
+ج) ابزارهای داخلی (Internal Tooling)
+python
+
+# CLI داخلی برای dev ها: ساخت env موقت
+def create_preview_env(pr_number, branch):
+    name = f"preview-{pr_number}"
+    v1.create_namespace(client.V1Namespace(metadata=client.V1ObjectMeta(name=name)))
+    apps_v1.create_namespaced_deployment(
+        namespace=name,
+        body=make_deployment(f"api:{branch}"),
+    )
+    return f"https://preview-{pr_number}.dev.company.com"
+
+د) Testing / Chaos Engineering
+python
+
+# حذف تصادفی پادها برای تست resilience
+from kubernetes import client, config
+import random, time
+
+config.load_kube_config()
+v1 = client.CoreV1Api()
+
+pods = v1.list_namespaced_pod("prod", label_selector="app=api").items
+random.choice(pods) and v1.delete_namespaced_pod(
+    random.choice(pods).metadata.name, "prod"
+)
+
+❌ ضدالگوهای Python
+python
+
+# ❌ هرگز CI/CD را با Python بنویس
+def deploy():
+    v1.patch_namespaced_deployment(...)   # ← چرا؟ ArgoCD دقیقاً همین کار را می‌کند
+    # نه Git history، نه rollback، نه drift detection
+
+# ❌ Reconciliation Loop از صفر
+while True:
+    ensure_replicas(3)   # ← دقیقاً کاری که ReplicaSet controller می‌کند
+    time.sleep(10)
+
+# ❌ Provisioning زیرساخت
+ec2 = boto3.client('ec2')
+ec2.run_instances(...)  # ← از Terraform استفاده کن
+
+⚠️ چرا؟ تمام کد Python سفارشی، بدهی فنی است: نه Git-based، نه rollback راحت، نه audit trail (مگر خودت بسازی)، نه drift detection.
+🏆 چکیده Best Practice
+📋 جدول تصمیم‌گیری
+کار	ابزار توصیه‌شده
+ساخت EKS/GKE/AKS	✅ Terraform
+VPC, IAM, S3, RDS	✅ Terraform
+نصب Cert-Manager / Ingress-NGINX	✅ Terraform (helm) یا ArgoCD
+Deployment یک اپ	✅ ArgoCD + Kustomize/Helm
+ConfigMap / Secret	✅ ArgoCD + Sealed Secrets / External Secrets
+تغییر تعداد replicas	✅ Git commit → ArgoCD sync
+Canary / Blue-Green	✅ Argo Rollouts (GitOps-compatible)
+دیباگ یک پاد در حال کرش	✅ kubectl
+اضافه کردن node اضطراری	✅ Terraform
+Custom Resource + منطق پیچیده	✅ Python (kopf)
+Preview Environment خودکار	✅ Python + ArgoCD ApplicationSet
+Testing و Chaos	✅ Python (chaos-mesh, kube-monkey)
+🎯 قانون طلایی (Golden Rules)
+1️⃣ Declarative over Imperative
+
+    هر چیزی که می‌خواهی بماند، باید Declarative باشد.
+    kubectl set/edit = فقط برای مواردی که می‌خواهی موقت باشد.
+
+2️⃣ Git as Single Source of Truth
+
+    اگر در Git نیست، وجود ندارد.
+    Python و kubectl اگر تغییر می‌دهند، باید خودشان را از Git همگام کنند (یا ArgoCD آن را اصلاح کند).
+
+3️⃣ Layered Ownership
+text
+
+Terraform  →  زیرساخت و کلاستر (state دارد)
+ArgoCD     →  منابع داخل کلاستر (Git دارد)
+Python     →  منطق پیچیده که دو تای بالا نمی‌توانند (نادر)
+kubectl    →  مشاهده و دیباگ (بدون تغییر پایدار)
+
+4️⃣ هرگز دو ابزار روی یک منبع
+
+    یک منبع K8s نباید هم‌زمان توسط Terraform و ArgoCD مدیریت شود → Conflict و Drift Loop می‌سازد.
+
+5️⃣ اگر Python می‌نویسی، دلیل مستند کن
+
+    در README بنویس: چرا ArgoCD/Terraform کافی نبود؟
+    این سوال در Code Review باید جواب داشته باشد.
+
+🧪 سناریوی واقعی — تیم ۵ نفره
+
+قبل از Best Practice (Anti-pattern):
+text
+
+DevOps با kubectl deploy می‌کند ❌
+Infra با ClickOps در AWS Console ❌
+Python script فقط برای اپ deploy (چرا؟) ❌
+
+بعد از Best Practice:
+text
+
+Terraform       → VPC, EKS, IAM, RDS, Add-ons
+ArgoCD + Helm   → Deployments, Services, Ingress
+Sealed Secrets  → Secrets
+Python (kopf)   → Operator برای DB provisioning سفارشی
+kubectl         → فقط debug
+
+📌 جمع‌بندی یک‌خطی
+
+    Terraform برای ساخت کلاستر، GitOps (ArgoCD) برای اجرای اپ، kubectl برای دیباگ، Python فقط وقتی که هیچ‌کدام جواب ندهند.
+ 

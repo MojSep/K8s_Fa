@@ -1,0 +1,714 @@
+﻿ مسیرها و فایل‌های مهم Kubernetes
+
+    مرجع کامل مسیرها بر اساس توزیع‌های استاندارد (kubeadm). در توزیع‌های managed (EKS/GKE/AKS) بعضی مسیرها در دسترس نیستند چون control-plane مدیریت‌شده است.
+
+🗺️ نمای کلی ساختار دایرکتوری
+text
+
+/etc/kubernetes/              ← تنظیمات اصلی (control plane + kubelet)
+/var/lib/kubelet/             ← state و config kubelet (همه نودها)
+/var/lib/etcd/                ← دیتابیس etcd (فقط master)
+/var/lib/docker/              ← state Docker (اگر از Docker runtime استفاده شود)
+/var/lib/containerd/          ← state containerd (پیش‌فرض مدرن)
+/var/log/                     ← لاگ‌های سیستم و کانتینرها
+/var/log/pods/                ← لاگ پادها (از symlink کانتینر runtime)
+/var/log/containers/          ← symlink به لاگ کانتینرها
+/run/                         ← runtime state (socket ها، pid ها)
+/opt/cni/bin/                 ← باینری‌های CNI plugin
+/etc/cni/net.d/               ← تنظیمات CNI
+/usr/local/bin/               ← باینری‌های kubectl/kubeadm (اگر دستی نصب شود)
+
+🎛️ بخش ۱: Control Plane (Master Node)
+📁 /etc/kubernetes/ — قلب تنظیمات کنترل‌پلین
+text
+
+/etc/kubernetes/
+├── admin.conf                    ← kubeconfig ادمین (کلید god-mode)
+├── controller-manager.conf       ← kubeconfig برای kube-controller-manager
+├── scheduler.conf                ← kubeconfig برای kube-scheduler
+├── kubelet.conf                  ← kubeconfig برای kubelet (روی master)
+├── super-admin.conf              ← (v1.29+) kubeconfig فوق‌ادمین
+│
+├── manifests/                    ← ❗ static pod manifests
+│   ├── etcd.yaml
+│   ├── kube-apiserver.yaml
+│   ├── kube-controller-manager.yaml
+│   └── kube-scheduler.yaml
+│
+├── pki/                          ← ❗ تمام certificate ها
+│   ├── ca.crt                    ← CA ریشه کلاستر
+│   ├── ca.key                    ← ⚠️ کلید خصوصی CA (بحرانی!)
+│   ├── apiserver.crt / .key
+│   ├── apiserver-kubelet-client.crt / .key
+│   ├── apiserver-etcd-client.crt / .key
+│   ├── front-proxy-ca.crt / .key
+│   ├── front-proxy-client.crt / .key
+│   ├── etcd/
+│   │   ├── ca.crt / .key
+│   │   ├── server.crt / .key
+│   │   ├── peer.crt / .key
+│   │   └── healthcheck-client.crt / .key
+│   └── sa.key / sa.pub           ← کلیدهای ServiceAccount
+│
+└── kubeadm-*                     ← (اختیاری) kubeadm configs
+
+📄 admin.conf — مهم‌ترین فایل برای شما
+yaml
+
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: <base64 CA>
+    server: https://10.0.0.1:6443
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: <base64 cert>
+    client-key-data: <base64 key>
+current-context: kubernetes-admin@kubernetes
+
+🔧 نکته فنی: این فایل به /etc/kubernetes/admin.conf و symlink در ~/.kube/config قرار می‌گیرد. این فایل معادل root shell روی کلاستر است — هر کسی آن را داشته باشد، می‌تواند هر کاری بکند. در production بعد از bootstrap، آن را جدا و دسترسی‌اش را محدود کنید.
+📄 manifests/kube-apiserver.yaml — تنظیمات API Server (Static Pod)
+yaml
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+  namespace: kube-system
+spec:
+  containers:
+  - command:
+    - kube-apiserver
+    - --advertise-address=10.0.0.1
+    - --allow-privileged=true
+    - --authorization-mode=Node,RBAC
+    - --client-ca-file=/etc/kubernetes/pki/ca.crt
+    - --enable-admission-plugins=NodeRestriction
+    - --etcd-servers=https://127.0.0.1:2379
+    - --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt
+    - --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt
+    - --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key
+    - --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt
+    - --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key
+    - --secure-port=6443
+    - --service-account-issuer=https://kubernetes.default.svc.cluster.local
+    - --service-account-key-file=/etc/kubernetes/pki/sa.pub
+    - --service-account-signing-key-file=/etc/kubernetes/pki/sa.key
+    - --service-cluster-ip-range=10.96.0.0/12
+    - --tls-cert-file=/etc/kubernetes/pki/apiserver.crt
+    - --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
+    image: registry.k8s.io/kube-apiserver:v1.29.x
+    # ...
+
+🔧 نکات فنی مهم:
+
+    Static Pod است؛ kubelet این فایل را مستقیم watch می‌کند و تغییرات را بلافاصله اعمال می‌کند.
+
+    --authorization-mode=Node,RBAC — استاندارد امنیتی؛ همیشه این را داشته باش.
+
+    --enable-admission-plugins=NodeRestriction — کافی نیست؛ در production PodSecurity، ResourceQuota، LimitRanger هم اضافه کن.
+
+    --service-cluster-ip-range — تغییرش بعد از bootstrap تقریباً غیرممکن است.
+
+📄 manifests/etcd.yaml — تنظیمات etcd
+yaml
+
+spec:
+  containers:
+  - command:
+    - etcd
+    - --advertise-client-urls=https://10.0.0.1:2379
+    - --cert-file=/etc/kubernetes/pki/etcd/server.crt
+    - --key-file=/etc/kubernetes/pki/etcd/server.key
+    - --data-dir=/var/lib/etcd
+    - --listen-client-urls=https://127.0.0.1:2379,https://10.0.0.1:2379
+    - --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt
+    # برای HA:
+    - --initial-cluster=master1=https://10.0.0.1:2380,master2=...,master3=...
+    - --peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt
+
+🔧 نکات فنی:
+
+    port 2379 = client (API server به آن وصل می‌شود)، 2380 = peer (master to master).
+
+    /var/lib/etcd = تمام state کلاستر. Backup فقط از این دایرکتوری یا etcdctl snapshot save معتبر است.
+
+    etcd یک raft consensus است — تعداد master باید فرد باشد (۳ یا ۵).
+
+    در حالت stacked، etcd روی همان نود API server است؛ در external etcd جداگانه.
+
+📄 manifests/kube-controller-manager.yaml
+yaml
+
+command:
+  - kube-controller-manager
+  - --allocate-node-cidrs=true
+  - --cluster-cidr=10.244.0.0/16
+  - --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt
+  - --cluster-signing-key-file=/etc/kubernetes/pki/ca.key
+  - --controllers=*,bootstrapsigner,tokencleaner
+  - --leader-elect=true
+  - --use-service-account-credentials=true
+  - --service-cluster-ip-range=10.96.0.0/12
+  - --kubeconfig=/etc/kubernetes/controller-manager.conf
+
+🔧 نکات فنی:
+
+    --allocate-node-cidrs — Pod CIDR را بین نودها تقسیم می‌کند؛ اگر اشتباه تنظیم شود، Podها ارتباط بین‌نودی ندارند.
+
+    --cluster-signing-* — برای CSR API (روتیت cert ها). حذفش certificate renewal را می‌شکند.
+
+    --leader-elect=true — در HA فقط یک instance فعال است.
+
+📄 manifests/kube-scheduler.yaml
+yaml
+
+command:
+  - kube-scheduler
+  - --authentication-kubeconfig=/etc/kubernetes/scheduler.conf
+  - --authorization-kubeconfig=/etc/kubernetes/scheduler.conf
+  - --bind-address=127.0.0.1
+  - --leader-elect=true
+  - --kubeconfig=/etc/kubernetes/scheduler.conf
+
+🔧 نکته فنی: برای تنظیم سفارشی scheduling از --config=/etc/kubernetes/scheduler-config.yaml و KubeSchedulerConfiguration استفاده کن (profiles، plugins، scoring).
+📁 /var/lib/etcd/ — دیتابیس کلاستر
+text
+
+/var/lib/etcd/
+└── member/
+    ├── snap/              ← snapshot های raft
+    │   ├── 0000000000000001-0000000000000001.snap
+    │   └── ...
+    ├── wal/               ← Write-Ahead Log (هر تغییر)
+    │   └── 0000000000000000.wal
+    └── db                 ← فایل main bolt DB
+
+🔧 نکات فنی حیاتی:
+
+    Backup: ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-$(date).db --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key
+
+    Restore: etcdctl snapshot restore بعدش static pod را restart کن.
+
+    ⚠️ هرگز کپی داغ (cp -r) از /var/lib/etcd نگیر — همیشه snapshot.
+
+    فضای دیسک: اگر >2GB شود، compaction خودکار انجام می‌شود (kube-apiserver آن را trigger می‌کند).
+
+📁 /var/log/ روی Master
+text
+
+/var/log/kube-apiserver.log       ← اگر با kubeadm باشد در pod logs
+/var/log/kube-controller-manager.log
+/var/log/kube-scheduler.log
+/var/log/etcd.log
+/var/log/kubelet.log
+/var/log/containers/              ← symlink به container logs
+/var/log/pods/                    ← لاگ پادها به تفکیک namespace/pod/container
+
+🔧 مسیر واقعی لاگ static pods:
+text
+
+/var/log/pods/kube-system_kube-apiserver-<node>_<uid>/kube-apiserver/0.log
+/var/log/pods/kube-system_etcd-<node>_<uid>/etcd/0.log
+
+✅ روش صحیح خواندن: kubectl logs -n kube-system kube-apiserver-master1
+📁 /etc/systemd/system/
+text
+
+kubelet.service              ← سرویس kubelet (روی همه نودها)
+kubelet.service.d/
+└── 10-kubeadm.conf         ← override با EnvironmentFile
+
+📄 10-kubeadm.conf نمونه:
+ini
+
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+ExecStart=
+ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS
+
+🔧 نکته فنی: override در /etc/systemd/system/kubelet.service.d/99-custom.conf بگذار — با systemctl daemon-reload && systemctl restart kubelet اعمال می‌شود.
+🖥️ بخش ۲: Worker Node (همه نودها)
+📁 /var/lib/kubelet/ — state کریتیکال kubelet
+text
+
+/var/lib/kubelet/
+├── config.yaml                  ← ❗ تنظیمات اصلی kubelet
+├── kubeadm-flags.env            ← env vars برای kubelet (kubeadm)
+│
+├── pki/                         ← certificate ها
+│   ├── kubelet-client-current.pem   ← symlink به cert فعال
+│   ├── kubelet-client-YYYY-MM-DD.pem
+│   ├── kubelet.crt / .key       ← cert self-signed (serving)
+│   └── kubelet-server-current.pem
+│
+├── pods/                        ← manifest و volumes پادها
+│   └── <pod-uid>/
+│       ├── volumes/
+│       │   ├── kubernetes.io~empty-dir/
+│       │   ├── kubernetes.io~configmap/
+│       │   ├── kubernetes.io~secret/
+│       │   └── kubernetes.io~projected/
+│       └── containers/
+│
+├── plugins/                     ← رجیستری CSI/Device plugins
+│   ├── device-plugins/
+│   │   └── kubelet.sock         ← Device Plugin API
+│   └── registry/
+│
+├── cpu_manager_state            ← CPU Manager state (static policy)
+├── memory_manager_state         ← Memory Manager
+├── pod-resources/               ← cgroups و resource state
+├── checkpoint/                  ← checkpoint پادها (اگر فعال)
+└── device-plugin/               ← device plugin sockets
+
+📄 /var/lib/kubelet/config.yaml — مهم‌ترین فایل روی نود
+yaml
+
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+authentication:
+  anonymous:
+    enabled: false                  # ⚠️ باید false باشد
+  webhook:
+    enabled: true
+  x509:
+    clientCAFile: /etc/kubernetes/pki/ca.crt
+authorization:
+  mode: Webhook                     # ⚠️ باید Webhook باشد
+clusterDomain: cluster.local
+clusterDNS:
+- 10.96.0.10
+cgroupDriver: systemd               # ⚠️ باید با runtime هماهنگ باشد
+containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
+evictionHard:
+  memory.available: "100Mi"
+  nodefs.available: "10%"
+  imagefs.available: "15%"
+failSwapOn: true                    # یا false اگر swap فعال است
+rotateCertificates: true            # ← روتیت خودکار client cert
+serverTLSBootstrap: true            # ← برای روتیت server cert
+staticPodPath: /etc/kubernetes/manifests
+
+🔧 نکات فنی بحرانی:
+فیلد	مقدار امن	چرا؟
+anonymous.enabled	false	جلوگیری از دسترسی بدون auth به kubelet API
+authorization.mode	Webhook	تا RBAC روی kubelet API اعمال شود
+rotateCertificates	true	renewal خودکار cert کلاستر
+serverTLSBootstrap	true	روتیت cert serving
+cgroupDriver	با runtime یکی	systemd ↔ containerd (نه cgroupfs)
+evictionHard	تنظیم‌شده	جلوگیری از OOM کل نود
+
+⚠️ تست امنیتی: curl -k https://NODE_IP:10250/pods — اگر response داد یعنی anonymous فعال است = نشت اطلاعات.
+📄 /var/lib/kubelet/kubeadm-flags.env
+bash
+
+KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix:///run/containerd/containerd.sock --pod-infra-container-image=registry.k8s.io/pause:3.9"
+
+🔧 نکته فنی: این فایل را kubeadm مدیریت می‌کند؛ تغییر دستی ممکن است در kubeadm upgrade بازنویسی شود. برای تنظیمات پایدار از config.yaml استفاده کن.
+📁 /run/ — runtime sockets و state
+text
+
+/run/
+├── containerd/
+│   └── containerd.sock          ← containerd socket (unix)
+├── cri-dockerd.sock             ← (اگر dockershim)
+├── kubelet/
+├── cri/
+├── flannel/                     ← فایل‌های flannel CNI
+│   └── subnet.env
+├── calico/
+├── netns/                       ← network namespaces کانتینرها
+│   └── cni-<hash>               ← (symlink به /var/run/netns/)
+├── secrets/kubernetes.io/
+│   └── serviceaccount/
+│       └── <namespace>/
+│           └── <sa-name>/       ← mount شده در پاد
+└── systemd/                     ← systemd sockets
+
+🔧 نکته فنی: /run = tmpfs؛ با reboot پاک می‌شود. اگر socket گم شد، kubelet restart کن.
+📁 /etc/cni/net.d/ — تنظیمات CNI
+text
+
+/etc/cni/net.d/
+├── 10-containerd-net.conflist   ← containerd bridge (اگر standalone)
+├── 10-flannel.conflist
+├── 10-calico.conflist
+└── 05-cilium.conf
+
+📄 نمونه 10-calico.conflist:
+json
+
+{
+  "cniVersion": "0.3.1",
+  "name": "k8s-pod-network",
+  "plugins": [
+    {
+      "type": "calico",
+      "log_level": "info",
+      "datastore_type": "kubernetes",
+      "mtu": 1440,
+      "ipam": {
+        "type": "calico-ipam"
+      },
+      "policy": { "type": "k8s" }
+    },
+    {
+      "type": "portmap",
+      "snat": true,
+      "capabilities": { "portMappings": true }
+    }
+  ]
+}
+
+🔧 نکات فنی:
+
+    ترتیب فایل‌ها مهم است؛ اولویتی که قبل‌تر alphabetically بیاید استفاده می‌شود (05 قبل 10).
+
+    فقط یک CNI فعال داشته باش؛ چند conflist = رفتار غیرقابل پیش‌بینی.
+
+    mtu باید از physical NIC کمتر باشد (VXLAN overhead ~50 byte؛ اگر NIC=1500 → MTU=1450).
+
+    پس از هر تغییر: systemctl restart containerd kubelet (یا حداقل restart کانتینرهای مرتبط).
+
+📁 /opt/cni/bin/ — باینری‌های plugin
+text
+
+/opt/cni/bin/
+├── bridge
+├── calico
+├── calico-ipam
+├── cilium-cni
+├── flannel
+├── host-local
+├── ipvlan
+├── loopback
+├── macvlan
+├── portmap
+├── ptp
+├── tuning
+└── vlan
+
+🔧 نکته فنی: CNI DaemonSet هنگام اجرا این‌ها را نصب می‌کند. اگر با kubeadm خودت نصب کردی، درست است که host-local و loopback را داشته باشی چون default CNI plugin هستند.
+📁 /etc/containerd/ — تنظیمات containerd
+text
+
+/etc/containerd/
+└── config.toml                  ← تنظیمات اصلی runtime
+
+📄 /etc/containerd/config.toml — بخش‌های مهم:
+toml
+
+version = 2
+root = "/var/lib/containerd"
+state = "/run/containerd"
+
+[grpc]
+  address = "/run/containerd/containerd.sock"
+
+[plugins."io.containerd.grpc.v1.cri"]
+  sandbox_image = "registry.k8s.io/pause:3.9"
+  enable_selinux = false
+  max_container_log_line_size = 16384
+
+  [plugins."io.containerd.grpc.v1.cri".containerd]
+    snapshotter = "overlayfs"
+    default_runtime_name = "runc"
+
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+      runtime_type = "io.containerd.runc.v2"
+
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+        SystemdCgroup = true       # ⚠️ باید با kubelet cgroupDriver یکی باشد
+
+  [plugins."io.containerd.grpc.v1.cri".registry]
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+      [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+        endpoint = ["https://mirror.internal/", "https://registry-1.docker.io"]
+
+  [plugins."io.containerd.grpc.v1.cri".registry.configs]
+    [plugins."io.containerd.grpc.v1.cri".registry.configs."registry.internal".auth]
+      username = "robot"
+      password = "xxx"
+
+  [plugins."io.containerd.grpc.v1.cri".cni]
+    bin_dir = "/opt/cni/bin"
+    conf_dir = "/etc/cni/net.d"
+
+🔧 نکات فنی بحرانی:
+
+    SystemdCgroup = true باید با cgroupDriver: systemd در kubelet یکی باشد. اختلاف باعث OOM، memory limit بی‌اثر، و pod restart می‌شود.
+
+    sandbox_image باید با نسخه kubelet سازگار باشد (pause 3.9 برای K8s 1.27+).
+
+    snapshotter — overlayfs پیش‌فرض؛ native برای debug، btrfs/zfs اگر FS مناسب است.
+
+    config_path در kubelet (--config-dir=/etc/containerd/certs.d) روش جدید و بهتر برای registry mirror است (جدا از config.toml).
+
+📁 /var/lib/containerd/ — state containerd
+text
+
+/var/lib/containerd/
+├── io.containerd.content.v1.content/   ← image layers (content store)
+│   └── blobs/sha256/
+├── io.containerd.snapshotter.v1.overlayfs/
+│   └── snapshots/
+├── io.containerd.metadata.v1.bolt/
+│   └── meta.db                          ← metadata (image, container, ...)
+├── io.containerd.runtime.v2.task/
+└── io.containerd.grpc.v1.cri/
+    ├── containers/
+    └── sandboxes/
+
+🔧 نکات فنی:
+
+    همیشه در حال رشد است — imagefs.available: 15% در kubelet eviction مهم است.
+
+    crictl ابزار دیباگ: crictl ps، crictl images، crictl logs <id>، crictl inspect <id>.
+
+    crictl rmi --prune برای پاکسازی image های بدون استفاده.
+
+📁 /etc/docker/daemon.json — (اگر از Docker runtime استفاده می‌کنید)
+json
+
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+  },
+  "storage-driver": "overlay2",
+  "registry-mirrors": ["https://mirror.internal/"],
+  "insecure-registries": ["registry.internal:5000"]
+}
+
+🔧 نکته فنی: از K8s 1.24، dockershim حذف شده. اگر Docker می‌خواهی، cri-dockerd نصب کن. مسیر state: /var/lib/docker/ (نه /var/lib/containerd/).
+📁 /var/log/ روی Worker Node
+text
+
+/var/log/
+├── pods/                                 ← لاگ پادها
+│   └── <namespace>_<pod>_<uid>/<container>/0.log
+├── containers/                           ← symlink به /var/log/pods/
+│   └── <pod>_<namespace>_<container>-<uid>.log
+├── kubelet.log (اگر journal نباشد)
+├── syslog
+└── journal/                              ← اگر journald
+
+🔧 نحوه دسترسی:
+bash
+
+# از داخل کانتینر runtime
+crictl logs <container-id>
+
+# از kubectl (اگر kubelet API دسترسی دارد)
+kubectl logs -n default <pod> -c <container>
+
+# symlink مستقیم
+ls -la /var/log/containers/ | grep mypod
+
+📁 /etc/systemd/system/kubelet.service.d/
+
+فایل‌های override برای kubelet. مثال اضافه کردن flag:
+ini
+
+# /etc/systemd/system/kubelet.service.d/99-custom.conf
+[Service]
+Environment="KUBELET_EXTRA_ARGS=--v=4 --node-labels=disk=ssd"
+
+سپس:
+bash
+
+systemctl daemon-reload
+systemctl restart kubelet
+
+🔀 بخش ۳: فایل‌های مشترک و محیطی
+📁 ~/.kube/config
+yaml
+
+apiVersion: v1
+kind: Config
+clusters: [...]
+users: [...]
+contexts: [...]
+current-context: production
+preferences: {}
+
+🔧 نکات فنی:
+
+    default path: $HOME/.kube/config، قابل override با KUBECONFIG.
+
+    multi-file: KUBECONFIG=/a:/b:/c → ادغام می‌شود.
+
+    دسترسی: chmod 600 ~/.kube/config (K8s خودش بررسی می‌کند).
+
+    command مفید: kubectl config view --raw (کلیدهای کامل را نشان می‌دهد)، kubectl config get-contexts.
+
+📁 /etc/hosts — برای hostname resolution
+text
+
+127.0.0.1   localhost
+10.0.0.1    master1
+10.0.0.2    worker1
+10.0.0.3    worker2
+
+🔧 نکته فنی: kubelet و kube-apiserver در HA به هم با hostname/CNI احتیاج دارند. اگر cert ها با DNS name صادر شده باشند، /etc/hosts باید همگام باشد یا DNS داخلی داشته باشی.
+📁 /etc/hostname و /etc/resolv.conf
+bash
+
+# /etc/hostname
+worker1
+
+🔧 نکته فنی: نام نود (node name) از hostname می‌آید (mگر --hostname-override). تغییر hostname بعد از join = orphan node در کلاستر.
+📁 /etc/sysctl.d/ — تنظیمات kernel (خیلی مهم برای networking)
+bash
+
+# /etc/sysctl.d/99-kubernetes-cri.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+net.ipv4.conf.all.forwarding        = 1
+
+# برای performance
+fs.inotify.max_user_watches         = 524288
+fs.inotify.max_user_instances       = 512
+fs.file-max                         = 2097152
+vm.max_map_count                    = 262144
+
+# برای کلاسترهای بزرگ
+net.ipv4.neigh.default.gc_thresh1   = 4096
+net.ipv4.neigh.default.gc_thresh2   = 8192
+net.ipv4.neigh.default.gc_thresh3   = 16384
+
+🔧 نکات فنی:
+
+    ip_forward=1 — بدون آن، پادها به هم route نمی‌شوند.
+
+    bridge-nf-call-iptables=1 — بدون آن، kube-proxy iptables درست کار نمی‌کند.
+
+    gc_thresh — در کلاسترهای >1000 پاد ضروری است (ARP table overflow).
+
+    اعمال: sysctl --system
+
+📁 /etc/modules-load.d/
+bash
+
+# /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+
+🔧 نکته فنی: overlay برای storage driver، br_netfilter برای iptables bridge. بدون br_netfilter، sysctl های بالا بی‌اثر می‌شوند (no file or directory error).
+📊 جدول جمع‌بندی — کدام فایل برای چه چیزی
+فایل	نود	نقش	حساسیت
+/etc/kubernetes/admin.conf	master	kubeconfig ادمین	🔴 بحرانی
+/etc/kubernetes/pki/ca.key	master	کلید CA ریشه	🔴 فوق‌بحرانی
+/etc/kubernetes/manifests/*.yaml	master	static pod ها	🔴 بحرانی
+/etc/kubernetes/kubelet.conf	همه	kubeconfig kubelet	🟡 مهم
+/var/lib/kubelet/config.yaml	همه	تنظیمات kubelet	🔴 بحرانی
+/var/lib/etcd/	master	state کلاستر	🔴 فوق‌بحرانی
+/etc/containerd/config.toml	همه	runtime	🟡 مهم
+/etc/cni/net.d/	همه	شبکه پاد	🟡 مهم
+/opt/cni/bin/	همه	باینری‌های CNI	🟢 معمولی
+/etc/sysctl.d/99-kubernetes-cri.conf	همه	kernel params	🟡 مهم
+/etc/modules-load.d/k8s.conf	همه	kernel modules	🟡 مهم
+/var/log/pods/	همه	لاگ‌ها	🟢 معمولی
+~/.kube/config	client	دسترسی	🟡 مهم
+/run/containerd/containerd.sock	همه	socket	🟡 مهم
+/var/lib/kubelet/pki/	همه	cert های kubelet	🟡 مهم
+🛡️ بخش ۴: چک‌لیست امنیتی و Backup
+🔐 فایل‌هایی که هرگز نباید عمومی باشند
+bash
+
+chmod 600 /etc/kubernetes/pki/ca.key
+chmod 600 /etc/kubernetes/pki/sa.key
+chmod 600 /etc/kubernetes/pki/etcd/ca.key
+chmod 600 /etc/kubernetes/admin.conf
+chmod 600 ~/.kube/config
+
+💾 Backup ضروری (روزانه)
+bash
+
+# ۱. etcd snapshot
+ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-$(date +%F).db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# ۲. PKI
+tar czf /backup/pki-$(date +%F).tgz /etc/kubernetes/pki/
+
+# ۳. manifests و configs
+tar czf /backup/etc-k8s-$(date +%F).tgz \
+  /etc/kubernetes/manifests/ \
+  /etc/kubernetes/*.conf
+
+# ۴. خود etcd (بعد از snapshot برای verify)
+etcdctl snapshot status /backup/etcd-$(date +%F).db
+
+🔍 چک‌های روتین
+bash
+
+# بررسی کارت‌های certificate
+kubeadm certs check-expiration
+
+# روتیت
+kubeadm certs renew all
+
+# بررسی وضعیت control plane
+kubectl get --raw='/readyz?verbose'
+kubectl get componentstatuses   # (deprecated)
+
+# بررسی health kubelet روی نود
+curl -k https://NODE_IP:10250/healthz
+
+# دیباگ CRI
+crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps
+crictl --runtime-endpoint unix:///run/containerd/containerd.sock images
+
+# بررسی namespace های مهم
+kubectl get pods -n kube-system
+
+⚡ بخش ۵: گلوگاه‌های رایج در مسیرها
+مشکل	فایل / مسیر	راه حل
+Node NotReady	/var/lib/kubelet/config.yaml	systemctl status kubelet و لاگ را ببین
+kubelet anonymous auth فعال	config.yaml → authentication.anonymous.enabled	false کن + restart
+Cgroup driver mismatch	config.yaml + /etc/containerd/config.toml	همیشه systemd
+Pod networking شکسته	/etc/sysctl.d/ + /etc/modules-load.d/	ip_forward و br_netfilter
+Image pull error	/etc/containerd/config.toml registry	mirror یا auth اضافه کن
+Certificate expired	/etc/kubernetes/pki/	kubeadm certs renew
+Disk pressure	/var/lib/containerd/	crictl rmi --prune + eviction threshold
+Pod CIDR conflict	/etc/kubernetes/manifests/kube-controller-manager.yaml	--cluster-cidr
+etcd leader change	/var/lib/etcd/	دیسک io کند است (NVMe)
+🎯 چکیده نهایی
+text
+
+Control Plane (Master):
+  /etc/kubernetes/           → تنظیمات و PKI
+  /etc/kubernetes/manifests/ → static pods
+  /var/lib/etcd/             → state کلاستر (⚠️ backup)
+
+Worker Node:
+  /var/lib/kubelet/          → config و state kubelet
+  /etc/containerd/           → runtime config
+  /etc/cni/net.d/            → شبکه
+  /opt/cni/bin/              → باینری‌های CNI
+  /var/log/pods/             → لاگ‌ها
+
+همه نودها:
+  /etc/sysctl.d/             → kernel params
+  /etc/modules-load.d/       → kernel modules
+  /run/*.sock                → sockets (tmpfs)
+
+    💡 قانون طلایی: وقتی دیباگ می‌کنی، همیشه از این ترتیب شروع کن:
+    kubectl describe → kubectl logs → journalctl -u kubelet → crictl ps/logs → بررسی مسیرهای بالا.

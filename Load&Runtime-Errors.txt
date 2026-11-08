@@ -1,0 +1,23 @@
+﻿🎛️ خرابی‌های نود مستر (Control Plane)
+
+    از کار افتادن etcd (از دست رفتن Quorum): اگر اکثریت نودهای etcd از دسترس خارج شوند، کلاستر قادر به انتخاب Leader جدید نیست و در وضعیت RAFT NO LEADER گیر می‌کند. باید از نود سالم باقی‌مانده بکاپ گرفته و با etcdctl snapshot restore کلاستر را به حالت تک‌نودی بازگردانی کنید تا کنترل‌پلین بالا بیاید.
+
+    خطا در آدرس‌دهی به etcd: اگر فایل kube-apiserver.yaml به IP یا پورت اشتباهی اشاره کند، API Server بالا نمی‌آید. باید فایل /etc/kubernetes/manifests/kube-apiserver.yaml را ویرایش کرده و مقدار --etcd-servers را دقیقاً با آدرس موجود در فایل etcd.yaml هماهنگ کنید.
+
+    گیر کردن API Server به دلیل خطای گواهی (Certificate): اگر گواهی kube-root-ca.crt منقضی یا نامعتبر شود، ممکن است حلقه بوت‌استرپ ایجاد شده و etcd مکرراً SIGTERM دریافت کند. باید گواهی‌ها را تمدید (kubeadm certs renew) و سرویس kubelet را ری‌استارت کنید.
+
+🖥️ خرابی‌های نود ورکر (Worker Node)
+
+    وضعیت NotReady به دلیل تنظیمات Cgroup: اگر درایور Cgroup بین kubelet و containerd (یا Docker) یکسان نباشد (مثلاً systemd در مقابل cgroupfs)، kubelet قادر به مدیریت منابع نخواهد بود و نود NotReady می‌شود. باید در /etc/containerd/config.toml مقدار SystemdCgroup = true را تنظیم و هر دو سرویس را ری‌استارت کنید.
+
+    عدم آماده‌سازی پیش‌نیازهای سیستم‌عامل: فعال بودن Swap باعث اختلال در عملکرد kubelet می‌شود (باید با swapoff -a غیرفعال و از /etc/fstab حذف شود). همچنین ماژول‌های کرنل مثل br_netfilter و overlay و پارامتر net.ipv4.ip_forward=1 باید فعال باشند تا شبکه پادها و iptables کار کند.
+
+    خطای نصب یا اجرای CNI: اگر پادهای CNI (مثل Calico یا Flannel) بالا نیایند یا پوشه /etc/cni/net.d خالی باشد، نود NotReady می‌ماند و پادها در وضعیت ContainerCreating گیر می‌کنند. باید وضعیت پادهای CNI را بررسی و پورت‌های مربوطه (مثل UDP 8472 برای VXLAN) را در فایروال باز کنید.
+
+    عدم دسترسی ورکر به API Server: اگر پورت 6443 روی مستر از سمت ورکر مسدود باشد، kubelet نمی‌تواند ثبت‌نام کند. باید با nc -vz <Master-IP> 6443 تست و فایروال را اصلاح کنید. همچنین اگر توکن عضویت منقضی شده، با kubeadm token create --print-join-command توکن جدید بسازید.
+
+🛠️ گردش‌کار گام‌به‌گام عیب‌یابی
+
+    بررسی وضعیت کلی کلاستر: با kubectl get nodes وضعیت نودها و با kubectl cluster-info dump سلامت کلی کلاستر را بررسی کنید. سپس با kubectl describe node <node-name> دلیل دقیق NotReady بودن (مثل KubeletNotReady یا NetworkUnavailable) را ببینید.
+
+    بررسی سرویس‌های حیاتی: در هر دو حالت، وضعیت kubelet (systemctl status kubelet) و containerd (systemctl status containerd) را چک کنید. در صورت خرابی، journalctl -u kubelet -f و journalctl -u containerd -f لاگ دقیق خطا را نشان می‌دهند.

@@ -1,0 +1,1384 @@
+﻿🐍 Python + Kubernetes — راهنمای عملیاتی DevOps
+
+    Python در لایه اتوماسیون سفارشی می‌نشیند: جایی که kubectl، Ansible یا GitOps نمی‌توانند منطق پیچیده را اجرا کنند. جایگزین آن‌ها نیست — مکمل برای موارد خاص است.
+
+🗺️ بخش ۱: جایگاه Python در اکوسیستم DevOps
+text
+
+┌───────────────────────────────────────────────────────────┐
+│ GitOps (ArgoCD/Flux)       ← App deploys (declarative)   │
+├───────────────────────────────────────────────────────────┤
+│ Helm/Kustomize             ← Packaging                    │
+├───────────────────────────────────────────────────────────┤
+│ 🐍 PYTHON                  ← Custom automation           │
+│   ✓ Operators / Controllers                              │
+│   ✓ Cross-cutting automation (cleanup, quotas)           │
+│   ✓ Internal tooling (CLI for devs)                      │
+│   ✓ Chaos engineering                                    │
+│   ✓ Cost optimization                                    │
+│   ✓ Compliance / drift audits (custom rules)             │
+│   ✓ Preview environments                                 │
+│   ✓ K8s API direct (بدون kubectl)                        │
+│   ✗ Deploy اپلیکیشن (از GitOps استفاده کن)               │
+│   ✗ ConfigMap/Secret management (از ESO استفاده کن)      │
+├───────────────────────────────────────────────────────────┤
+│ Ansible                    ← Bootstrap, OS, upgrade     │
+├───────────────────────────────────────────────────────────┤
+│ Terraform                  ← Infrastructure               │
+└───────────────────────────────────────────────────────────┘
+
+📚 بخش ۲: کتابخانه‌ها — انتخاب درست
+۲.۱ — جدول مقایسه
+کتابخانه	کاربرد	سطح
+kubernetes (official client)	API مستقیم، هر resource	پایین‌سطح
+kopf	Operator framework (CRD + reconciler)	سطح Operator
+kr8s	جایگزین مدرن و پایتونیک‌تر client	میان‌سطح
+pykube-ng	client سبک، قدیمی	میان‌سطح
+openshift	client رسمی OpenShift (فورک kubernetes)	مشابه
+lightkube	client async/sync سبک	میان‌سطح
+kubernetes-asyncio	async/await client	پایین‌سطح
+۲.۲ — نصب
+bash
+
+pip install kubernetes>=31.0.0        # client رسمی
+pip install kopf>=1.37.0               # operator framework
+pip install kr8s>=0.20.0               # client پایتونیک مدرن
+pip install kubernetes-asyncio>=31.0.0 # async
+
+۲.۳ — چه زمانی کدام؟
+text
+
+می‌خواهی Operator بنویسی؟                 → kopf
+می‌خواهی اسکریپت ساده بنویسی؟             → kubernetes (official)
+می‌خواهی async بنویسی؟                    → kubernetes-asyncio
+می‌خواهی کد پایتونیک و مدرن باشد؟         → kr8s
+می‌خواهی با CRD کار کنی؟                  → kopf یا kubernetes با CRD
+
+🔐 بخش ۳: Authentication — سه سناریو
+۳.۱ — از روی سیستم محلی (kubeconfig)
+python
+
+from kubernetes import client, config
+
+# روش ۱: kubeconfig پیش‌فرض (~/.kube/config)
+config.load_kube_config()
+
+# روش ۲: kubeconfig صریح
+config.load_kube_config(config_file="/etc/kubernetes/admin.conf")
+
+# روش ۳: انتخاب context خاص
+config.load_kube_config(context="prod-us")
+
+۳.۲ — از داخل Pod (ServiceAccount)
+python
+
+from kubernetes import client, config
+
+# داخل Pod — همیشه از SA استفاده می‌کند
+config.load_incluster_config()
+
+# یا صریح:
+# config.load_incluster_config(
+#     host="https://kubernetes.default.svc",
+#     ssl_ca_cert="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+#     token_filename="/var/run/secrets/kubernetes.io/serviceaccount/token"
+# )
+
+v1 = client.CoreV1Api()
+pods = v1.list_namespaced_pod("default")
+print(f"Pods: {len(pods.items)}")
+
+۳.۳ — از راه دور با Token
+python
+
+from kubernetes import client
+
+configuration = client.Configuration()
+configuration.host = "https://k8s-api:6443"
+configuration.api_key = {
+    "authorization": f"Bearer {TOKEN}"
+}
+configuration.verify_ssl = True
+configuration.ssl_ca_cert = "/path/ca.crt"
+
+api_client = client.ApiClient(configuration)
+v1 = client.CoreV1Api(api_client)
+
+🎯 بخش ۴: موارد استفاده عملیاتی واقعی
+📄 ۴.۱ — Cleanup خودکار پادهای Completed
+
+سناریو: روی کلاستر شما روزانه صدها Job تمام‌شده با status Completed باقی می‌مانند و فضای etcd را پر می‌کنند.
+python
+
+#!/usr/bin/env python3
+"""
+cleanup-completed-pods.py
+حذف پادهای Completed قدیمی‌تر از N ساعت
+"""
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from kubernetes import client, config
+import logging
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+# ── Config ──
+config.load_kube_config(context="prod")
+v1 = client.CoreV1Api()
+
+MAX_AGE_HOURS = 24
+DRY_RUN = "--apply" not in sys.argv
+EXCLUDED_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease",
+                       "calico-system", "tigera-operator"}
+
+def should_delete(pod, now):
+    """آیا این پاد باید حذف شود؟"""
+    ns = pod.metadata.namespace
+    if ns in EXCLUDED_NAMESPACES:
+        return False, "protected namespace"
+    if pod.status.phase not in ("Succeeded", "Failed"):
+        return False, f"phase={pod.status.phase}"
+    # زمان پایان از containerStatuses
+    finished = None
+    for cs in pod.status.container_statuses or []:
+        term = cs.state.terminated
+        if term and term.finished_at:
+            finished = term.finished_at
+    if not finished:
+        return False, "no finish time"
+    age = now - finished
+    if age < timedelta(hours=MAX_AGE_HOURS):
+        return False, f"only {age}"
+    return True, f"age={age}"
+
+def main():
+    now = datetime.now(timezone.utc)
+    deleted = 0
+    skipped = 0
+    errors = 0
+    pods = v1.list_pod_for_all_namespaces()
+    log.info("Scanning %d pods", len(pods.items))
+    for pod in pods.items:
+        try:
+            ok, reason = should_delete(pod, now)
+            if not ok:
+                skipped += 1
+                continue
+            ns = pod.metadata.namespace
+            name = pod.metadata.name
+            if DRY_RUN:
+                log.info("[DRY] would delete %s/%s (%s)", ns, name, reason)
+            else:
+                v1.delete_namespaced_pod(name, ns, grace_period_seconds=0)
+                log.info("✅ deleted %s/%s", ns, name)
+            deleted += 1
+        except client.exceptions.ApiException as e:
+            errors += 1
+            log.error("❌ %s/%s: %s",
+                      pod.metadata.namespace, pod.metadata.name,
+                      e.reason)
+    log.info("Summary: deleted=%d skipped=%d errors=%d dry=%s",
+             deleted, skipped, errors, DRY_RUN)
+    sys.exit(1 if errors else 0)
+
+if __name__ == "__main__":
+    main()
+
+اجرا:
+bash
+
+# Dry-run:
+python3 cleanup-completed-pods.py
+# ✅ چک: خروجی "[DRY] would delete default/backup-xyz (age=2 days, 3:00:00)"
+
+# واقعی:
+python3 cleanup-completed-pods.py --apply
+
+# ✅ چک:
+kubectl get pods -A --field-selector=status.phase=Succeeded | wc -l
+# انتظار: 0
+
+RBAC لازم:
+yaml
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-cleanup
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, get, delete]
+
+📄 ۴.۲ — Cost Audit — پیدا کردن پادهای بی‌مصرف
+
+سناریو: پیدا کردن پادهایی که requests می‌گیرند ولی هیچ مصرف واقعی ندارند (over-provisioning).
+python
+
+#!/usr/bin/env python3
+"""
+cost-audit.py
+پیدا کردن pods/nodes با mismatch بین requests و usage واقعی
+"""
+import json
+from collections import defaultdict
+from kubernetes import client, config
+
+config.load_kube_config()
+
+v1 = client.CoreV1Api()
+custom = client.CustomObjectsApi()
+
+# ── مصرف واقعی از Metrics API ──
+def get_pod_usage():
+    """returns dict[(ns, name)] = {cpu_m, mem_mi}"""
+    usage = {}
+    try:
+        data = custom.list_cluster_custom_object(
+            "metrics.k8s.io", "v1beta1", "pods")
+        for item in data["items"]:
+            key = (item["metadata"]["namespace"], item["metadata"]["name"])
+            containers = item.get("containers", [])
+            cpu = sum(int(c["usage"]["cpu"].rstrip("n")) / 1_000_000
+                      for c in containers if "cpu" in c["usage"])
+            # CPU در n، تبدیل به m
+            cpu_m = 0
+            for c in containers:
+                if "cpu" in c["usage"]:
+                    val = c["usage"]["cpu"]
+                    if val.endswith("n"):
+                        cpu_m += int(val[:-1]) / 1_000_000
+                    elif val.endswith("u"):
+                        cpu_m += int(val[:-1]) / 1_000
+                    elif val.endswith("m"):
+                        cpu_m += int(val[:-1])
+                    else:
+                        cpu_m += int(val) * 1000
+            mem_mi = 0
+            for c in containers:
+                if "memory" in c["usage"]:
+                    val = c["usage"]["memory"]
+                    if val.endswith("Ki"):
+                        mem_mi += int(val[:-2]) / 1024
+                    elif val.endswith("Mi"):
+                        mem_mi += int(val[:-2])
+                    elif val.endswith("Gi"):
+                        mem_mi += int(val[:-2]) * 1024
+            usage[key] = {"cpu_m": cpu_m, "mem_mi": mem_mi}
+    except client.exceptions.ApiException as e:
+        print(f"⚠️  Metrics API not available: {e.reason}")
+    return usage
+
+# ── requests اعلامی ──
+def parse_quantity(q):
+    """تبدیل K8s Quantity به float (CPU in m, memory in Mi)"""
+    if not q:
+        return 0
+    q = str(q)
+    for suf, mul in [("m", 1), ("u", 0.001), ("n", 0.000001),
+                     ("Ki", 1/1024), ("Mi", 1), ("Gi", 1024)]:
+        if q.endswith(suf):
+            return float(q[:-len(suf)]) * mul
+    return float(q)
+
+def get_pod_requests():
+    requests = {}
+    for pod in v1.list_pod_for_all_namespaces().items:
+        if pod.status.phase != "Running":
+            continue
+        key = (pod.metadata.namespace, pod.metadata.name)
+        cpu = sum(parse_quantity(c.resources.requests.get("cpu", "0"))
+                  for c in pod.spec.containers
+                  if c.resources and c.resources.requests)
+        mem = sum(parse_quantity(c.resources.requests.get("memory", "0"))
+                  for c in pod.spec.containers
+                  if c.resources and c.resources.requests)
+        requests[key] = {"cpu_m": cpu, "mem_mi": mem}
+    return requests
+
+def main():
+    usage = get_pod_usage()
+    requests = get_pod_requests()
+
+    print(f"{'NAMESPACE':<20} {'POD':<40} {'CPU REQ':<10} {'CPU USE':<10} "
+          f"{'MEM REQ':<10} {'MEM USE':<10} {'CPU%':<6} {'MEM%':<6}")
+    print("=" * 130)
+
+    total_cpu_waste = 0
+    total_mem_waste = 0
+    for key, req in requests.items():
+        use = usage.get(key, {"cpu_m": 0, "mem_mi": 0})
+        cpu_pct = (use["cpu_m"] / req["cpu_m"] * 100) if req["cpu_m"] else 0
+        mem_pct = (use["mem_mi"] / req["mem_mi"] * 100) if req["mem_mi"] else 0
+        # فقط پادهای کم‌مصرف را نشان بده
+        if cpu_pct < 20 or mem_pct < 20:
+            ns, name = key
+            print(f"{ns:<20} {name[:38]:<40} "
+                  f"{req['cpu_m']:<10.0f} {use['cpu_m']:<10.0f} "
+                  f"{req['mem_mi']:<10.0f} {use['mem_mi']:<10.0f} "
+                  f"{cpu_pct:<6.1f} {mem_pct:<6.1f}")
+            total_cpu_waste += max(0, req["cpu_m"] - use["cpu_m"])
+            total_mem_waste += max(0, req["mem_mi"] - use["mem_mi"])
+
+    print("=" * 130)
+    print(f"Total CPU waste:    {total_cpu_waste/1000:.2f} cores")
+    print(f"Total memory waste: {total_mem_waste/1024:.2f} Gi")
+
+    # output JSON برای Grafana
+    with open("/tmp/cost-audit.json", "w") as f:
+        json.dump({
+            "total_cpu_waste_cores": total_cpu_waste/1000,
+            "total_memory_waste_gi": total_mem_waste/1024,
+            "pods": len(requests),
+        }, f, indent=2)
+
+if __name__ == "__main__":
+    main()
+
+اجرا:
+bash
+
+python3 cost-audit.py
+# خروجی: جدول پادهای کم‌مصرف + مجموع waste
+
+# ✅ چک: فایل JSON
+cat /tmp/cost-audit.json | jq .
+
+📄 ۴.۳ — Node Drain هوشمند (با احترام به PDB)
+python
+
+#!/usr/bin/env python3
+"""
+smart-drain.py
+Drain یک نود با احترام به PodDisruptionBudget
+"""
+import sys
+import time
+from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
+import logging
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+config.load_kube_config()
+v1 = client.CoreV1Api()
+apps = client.AppsV1Api()
+policy = client.PolicyV1Api()
+
+NODE = sys.argv[1] if len(sys.argv) > 1 else None
+if not NODE:
+    log.error("Usage: smart-drain.py <node>")
+    sys.exit(1)
+
+def get_pods_on_node(node):
+    pods = v1.list_pod_for_all_namespaces(
+        field_selector=f"spec.nodeName={node}").items
+    # فیلتر DaemonSet و mirror pods
+    result = []
+    for p in pods:
+        if p.metadata.owner_references:
+            kind = p.metadata.owner_references[0].kind
+            if kind == "DaemonSet":
+                continue
+        if p.metadata.annotations and "kubernetes.io/config.mirror" in p.metadata.annotations:
+            continue
+        result.append(p)
+    return result
+
+def get_pdb_for_pod(pod):
+    """پیدا کردن PDB مربوط به یک pod"""
+    pdbs = policy.list_pod_disruption_budget_for_all_namespaces().items
+    matching = []
+    for pdb in pdbs:
+        if pdb.metadata.namespace != pod.metadata.namespace:
+            continue
+        sel = pdb.spec.selector
+        if not sel:
+            continue
+        # matchLabels
+        pod_labels = pod.metadata.labels or {}
+        for k, v in (sel.match_labels or {}).items():
+            if pod_labels.get(k) != v:
+                break
+        else:
+            matching.append(pdb)
+    return matching
+
+def check_pdb_allowance(pdb):
+    """آیا PDB اجازه‌ی evict می‌دهد؟"""
+    st = pdb.status
+    if not st:
+        return False, "no status"
+    if st.disruptions_allowed and st.disruptions_allowed > 0:
+        return True, f"allowed={st.disruptions_allowed}"
+    return False, f"allowed={st.disruptions_allowed or 0}, " \
+                  f"current={st.current_healthy or 0}, " \
+                  f"desired={st.desired_healthy or 0}"
+
+def main():
+    # ۱. Cordon
+    log.info("Cordoning %s", NODE)
+    body = {"spec": {"unschedulable": True}}
+    v1.patch_node(NODE, body)
+
+    # ۲. پادها
+    pods = get_pods_on_node(NODE)
+    log.info("Found %d pods on %s", len(pods), NODE)
+
+    # ۳. Evict با احترام به PDB
+    evicted = 0
+    failed = []
+    for pod in pods:
+        ns = pod.metadata.namespace
+        name = pod.metadata.name
+
+        # چک PDB
+        pdbs = get_pdb_for_pod(pod)
+        can_evict = True
+        for pdb in pdbs:
+            ok, reason = check_pdb_allowance(pdb)
+            if not ok:
+                can_evict = False
+                log.warning("⏸️  %s/%s blocked by PDB %s: %s",
+                            ns, name, pdb.metadata.name, reason)
+                break
+
+        if not can_evict:
+            failed.append((ns, name, "PDB blocked"))
+            continue
+
+        # Eviction API — نسخه‌ی صحیح
+        try:
+            eviction = client.V1Eviction(
+                metadata=client.V1ObjectMeta(name=name, namespace=ns),
+                delete_options=client.V1DeleteOptions(
+                    grace_period_seconds=30))
+            v1.create_namespaced_pod_eviction(name, ns, eviction)
+            log.info("✅ evicted %s/%s", ns, name)
+            evicted += 1
+        except ApiException as e:
+            if e.status == 429:
+                log.warning("⏸️  %s/%s: too many requests (retry)", ns, name)
+                failed.append((ns, name, "429"))
+            else:
+                log.error("❌ %s/%s: %s", ns, name, e.reason)
+                failed.append((ns, name, e.reason))
+
+    # ۴. اگر پادها باقی ماندند، منتظر PDB
+    retries = 30
+    while failed and retries > 0:
+        retries -= 1
+        log.info("Retry %d — %d pods remaining", 30 - retries, len(failed))
+        time.sleep(10)
+        new_failed = []
+        for ns, name, _ in failed:
+            try:
+                eviction = client.V1Eviction(
+                    metadata=client.V1ObjectMeta(name=name, namespace=ns))
+                v1.create_namespaced_pod_eviction(name, ns, eviction)
+                log.info("✅ evicted %s/%s (retry)", ns, name)
+                evicted += 1
+            except ApiException as e:
+                new_failed.append((ns, name, e.reason))
+        failed = new_failed
+
+    if failed:
+        log.error("❌ Some pods could not be evicted: %s", failed)
+        sys.exit(1)
+
+    log.info("✅ Draining complete: %d pods evicted", evicted)
+
+if __name__ == "__main__":
+    main()
+
+اجرا:
+bash
+
+python3 smart-drain.py worker1
+
+# ✅ چک:
+kubectl get nodes worker1
+# انتظار: worker1  Ready,SchedulingDisabled
+
+kubectl get pods -A -o wide --field-selector spec.nodeName=worker1 | \
+  grep -v DaemonSet | grep -v Completed
+# انتظار: خالی
+
+📄 ۴.۴ — Preview Environments از Pull Request
+
+سناریو: با هر PR، یک namespace موقت با نسخه‌ی اپ PR ساخته شود.
+python
+
+#!/usr/bin/env python3
+"""
+preview-env.py
+ساخت/حذف preview environment برای Pull Request
+Usage:
+  preview-env.py create --pr 123 --branch feature-x
+  preview-env.py delete --pr 123
+"""
+import argparse
+import sys
+from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
+
+config.load_incluster_config()  # داخل cluster
+
+v1 = client.CoreV1Api()
+apps = client.AppsV1Api()
+networking = client.NetworkingV1Api()
+
+def create_preview(pr, branch):
+    ns_name = f"preview-pr-{pr}"
+    image_tag = f"pr-{pr}"  # CI image tag convention
+
+    # ۱. Namespace
+    try:
+        v1.create_namespace(client.V1Namespace(
+            metadata=client.V1ObjectMeta(
+                name=ns_name,
+                labels={
+                    "preview": "true",
+                    "pr": str(pr),
+                    "ttl": "72h",  # label برای cleanup
+                })))
+        print(f"✅ namespace {ns_name}")
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+    # ۲. Deployment
+    deployment = client.V1Deployment(
+        metadata=client.V1ObjectMeta(name="app", namespace=ns_name),
+        spec=client.V1DeploymentSpec(
+            replicas=1,
+            selector=client.V1LabelSelector(match_labels={"app": "app"}),
+            template=client.V1PodTemplateSpec(
+                metadata=client.V1ObjectMeta(labels={"app": "app"}),
+                spec=client.V1PodSpec(
+                    containers=[
+                        client.V1Container(
+                            name="app",
+                            image=f"registry.local/app:{image_tag}",
+                            ports=[client.V1ContainerPort(container_port=8080)],
+                            env=[
+                                client.V1EnvVar(name="BRANCH", value=branch),
+                                client.V1EnvVar(name="PR", value=str(pr)),
+                                client.V1EnvVar(name="ENV", value="preview"),
+                            ],
+                            resources=client.V1ResourceRequirements(
+                                requests={"cpu": "100m", "memory": "128Mi"},
+                                limits={"cpu": "500m", "memory": "512Mi"},
+                            ),
+                            readiness_probe=client.V1Probe(
+                                http_get=client.V1HTTPGetAction(
+                                    path="/healthz", port=8080),
+                                initial_delay_seconds=5,
+                                period_seconds=5,
+                            ),
+                        )
+                    ]
+                )
+            )
+        )
+    )
+    try:
+        apps.create_namespaced_deployment(ns_name, deployment)
+        print(f"✅ deployment {ns_name}/app")
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+    # ۳. Service
+    svc = client.V1Service(
+        metadata=client.V1ObjectMeta(name="app", namespace=ns_name),
+        spec=client.V1ServiceSpec(
+            selector={"app": "app"},
+            ports=[client.V1ServicePort(port=80, target_port=8080)],
+        )
+    )
+    try:
+        v1.create_namespaced_service(ns_name, svc)
+        print(f"✅ service {ns_name}/app")
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+    # ۴. Ingress
+    ingress = client.V1Ingress(
+        metadata=client.V1ObjectMeta(
+            name="app",
+            namespace=ns_name,
+            annotations={"cert-manager.io/cluster-issuer": "letsencrypt"}),
+        spec=client.V1IngressSpec(
+            rules=[client.V1IngressRule(
+                host=f"pr-{pr}.preview.example.com",
+                http=client.V1HTTPIngressRuleValue(
+                    paths=[client.V1HTTPIngressPath(
+                        path="/",
+                        path_type="Prefix",
+                        backend=client.V1IngressBackend(
+                            service=client.V1IngressServiceBackend(
+                                name="app",
+                                port=client.V1ServiceBackendPort(number=80),
+                            )
+                        )
+                    )]
+                )
+            )],
+            tls=[client.V1IngressTLS(
+                hosts=[f"pr-{pr}.preview.example.com"],
+                secret_name=f"pr-{pr}-tls",
+            )]
+        )
+    )
+    try:
+        networking.create_namespaced_ingress(ns_name, ingress)
+        print(f"✅ ingress pr-{pr}.preview.example.com")
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+    return f"https://pr-{pr}.preview.example.com"
+
+def delete_preview(pr):
+    ns_name = f"preview-pr-{pr}"
+    try:
+        v1.delete_namespace(ns_name)
+        print(f"✅ deleted {ns_name}")
+    except ApiException as e:
+        if e.status == 404:
+            print(f"⚠️  {ns_name} not found")
+        else:
+            raise
+
+def main():
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("create")
+    c.add_argument("--pr", type=int, required=True)
+    c.add_argument("--branch", required=True)
+    d = sub.add_parser("delete")
+    d.add_argument("--pr", type=int, required=True)
+    args = p.parse_args()
+
+    if args.cmd == "create":
+        url = create_preview(args.pr, args.branch)
+        print(f"\n🚀 Preview ready: {url}")
+    elif args.cmd == "delete":
+        delete_preview(args.pr)
+
+if __name__ == "__main__":
+    main()
+
+GitHub Actions:
+yaml
+
+name: preview-env
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+
+jobs:
+  manage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install kubernetes
+      - name: Create/Delete preview
+        env:
+          KUBECONFIG: ${{ secrets.PREVIEW_KUBECONFIG }}
+          PR: ${{ github.event.pull_request.number }}
+          BRANCH: ${{ github.head_ref }}
+          ACTION: ${{ github.event.action }}
+        run: |
+          if [ "$ACTION" = "closed" ]; then
+            python3 preview-env.py delete --pr $PR
+          else
+            python3 preview-env.py create --pr $PR --branch $BRANCH
+          fi
+
+📄 ۴.۵ — Compliance Checker — چک امنیتی سفارشی
+
+سناریو: قوانین سازمانی که OPA/Gatekeeper پاسخگو نیست (منطق پیچیده).
+python
+
+#!/usr/bin/env python3
+"""
+compliance-check.py
+قوانین سفارشی سازمانی — خروجی برای Prometheus + exit code
+"""
+import json
+import re
+from kubernetes import client, config
+from collections import defaultdict
+
+config.load_kube_config(context="prod")
+v1 = client.CoreV1Api()
+apps = client.AppsV1Api()
+
+violations = defaultdict(list)
+
+def check():
+    # ── قانون ۱: همه‌ی deploymentها باید livenessProbe داشته باشند ──
+    for d in apps.list_deployment_for_all_namespaces().items:
+        ns, name = d.metadata.namespace, d.metadata.name
+        for c in d.spec.template.spec.containers:
+            if not c.liveness_probe:
+                violations["missing-liveness-probe"].append(f"{ns}/{name}/{c.name}")
+
+    # ── قانون ۲: image باید از registry.local باشد ──
+    for d in apps.list_deployment_for_all_namespaces().items:
+        ns, name = d.metadata.namespace, d.metadata.name
+        for c in d.spec.template.spec.containers:
+            if not c.image.startswith("registry.local/"):
+                violations["untrusted-registry"].append(
+                    f"{ns}/{name}/{c.name}={c.image}")
+
+    # ── قانون ۳: همه‌ی podها باید runAsNonRoot باشند ──
+    for p in v1.list_pod_for_all_namespaces().items:
+        if p.status.phase != "Running":
+            continue
+        ns, name = p.metadata.namespace, p.metadata.name
+        sc = p.spec.security_context
+        if not sc or not sc.run_as_non_root:
+            # چک container-level
+            has_csc = any(c.security_context and c.security_context.run_as_non_root
+                          for c in p.spec.containers)
+            if not has_csc:
+                violations["not-runAsNonRoot"].append(f"{ns}/{name}")
+
+    # ── قانون ۴: هیچ pod نباید privileged باشد ──
+    for p in v1.list_pod_for_all_namespaces().items:
+        ns, name = p.metadata.namespace, p.metadata.name
+        for c in p.spec.containers:
+            sc = c.security_context
+            if sc and sc.privileged:
+                violations["privileged-container"].append(f"{ns}/{name}/{c.name}")
+
+    # ── قانون ۵: resource limits الزامی ──
+    for d in apps.list_deployment_for_all_namespaces().items:
+        ns, name = d.metadata.namespace, d.metadata.name
+        for c in d.spec.template.spec.containers:
+            if not c.resources or not c.resources.limits:
+                violations["missing-limits"].append(f"{ns}/{name}/{c.name}")
+
+    # ── قانون ۶: namespace باید label team داشته باشد ──
+    for ns in v1.list_namespace().items:
+        n = ns.metadata.name
+        if n.startswith("kube-"):
+            continue
+        labels = ns.metadata.labels or {}
+        if "team" not in labels:
+            violations["namespace-no-team-label"].append(n)
+
+def main():
+    check()
+    total = sum(len(v) for v in violations.values())
+
+    # خروجی متنی
+    print(f"\n{'='*70}")
+    print(f"Compliance Report — {total} violations")
+    print(f"{'='*70}\n")
+    for rule, items in violations.items():
+        print(f"❌ {rule}: {len(items)}")
+        for item in items[:10]:
+            print(f"     - {item}")
+        if len(items) > 10:
+            print(f"     ... and {len(items)-10} more")
+        print()
+
+    # خروجی Prometheus (textfile collector)
+    lines = [
+        "# HELP k8s_compliance_violations_total Violations per rule",
+        "# TYPE k8s_compliance_violations_total gauge",
+    ]
+    for rule, items in violations.items():
+        lines.append(f'k8s_compliance_violations_total{{rule="{rule}"}} {len(items)}')
+    lines.append(f'k8s_compliance_violations_total{{rule="total"}} {total}')
+
+    with open("/var/lib/node_exporter/textfile/k8s_compliance.prom", "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    # خروجی JSON
+    with open("/var/log/k8s/compliance.json", "w") as f:
+        json.dump({k: v for k, v in violations.items()}, f, indent=2)
+
+    # exit code برای CI
+    return 1 if total > 0 else 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+اجرا:
+bash
+
+python3 compliance-check.py
+echo "exit=$?"
+# انتظار: exit=0 اگر همه چیز پاس باشد
+
+cat /var/lib/node_exporter/textfile/k8s_compliance.prom
+# خروجی Prometheus
+
+cat /var/log/k8s/compliance.json | jq .
+
+📄 ۴.۶ — Chaos Engineering — Killed Pods
+python
+
+#!/usr/bin/env python3
+"""
+chaos-kill.py
+حذف تصادفی پادها برای تست resilience — با احترام به PDB
+"""
+import random
+import sys
+import time
+from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
+
+config.load_kube_config(context="staging")  # ❗ هرگز prod
+v1 = client.CoreV1Api()
+
+NAMESPACE = sys.argv[1] if len(sys.argv) > 1 else "default"
+LABEL = sys.argv[2] if len(sys.argv) > 2 else "app=api"
+COUNT = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+
+# چک: نه در prod
+ctx = config.list_kube_config_contexts()[1].get("name", "")
+if "prod" in ctx.lower():
+    print("❌ Refusing to run against production")
+    sys.exit(1)
+
+pods = v1.list_namespaced_pod(
+    NAMESPACE,
+    label_selector=LABEL).items
+
+running = [p for p in pods if p.status.phase == "Running"]
+print(f"Found {len(running)} running pods in {NAMESPACE} ({LABEL})")
+
+if len(running) <= COUNT:
+    print("⚠️  Not enough pods to kill")
+    sys.exit(1)
+
+victims = random.sample(running, COUNT)
+for pod in victims:
+    print(f"💀 killing {pod.metadata.namespace}/{pod.metadata.name}")
+    try:
+        v1.delete_namespaced_pod(
+            pod.metadata.name, pod.metadata.namespace,
+            grace_period_seconds=0)
+    except ApiException as e:
+        print(f"   ❌ {e.reason}")
+
+# منتظر replacement
+print("\n⏳ Waiting for replacements...")
+for _ in range(30):
+    time.sleep(2)
+    current = v1.list_namespaced_pod(NAMESPACE, label_selector=LABEL).items
+    healthy = sum(1 for p in current if p.status.phase == "Running")
+    print(f"   running: {healthy}")
+    if healthy >= len(running):
+        print("✅ recovered")
+        sys.exit(0)
+
+print("❌ did not recover in 60s")
+sys.exit(1)
+
+🤖 بخش ۵: Operator با kopf — قلب اتوماسیون
+📄 ۵.۱ — Custom Resource Definition
+yaml
+
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.myorg.io
+spec:
+  group: myorg.io
+  names:
+    kind: Database
+    plural: databases
+    singular: database
+    shortNames: [db]
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [engine, size]
+              properties:
+                engine:
+                  type: string
+                  enum: [postgres, mysql]
+                size:
+                  type: string
+                  enum: [small, medium, large]
+                version:
+                  type: string
+                  default: "16"
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                endpoint:
+                  type: string
+
+📄 ۵.۲ — Operator با kopf
+python
+
+#!/usr/bin/env python3
+"""
+database-operator.py
+Operator برای provisioning دیتابیس با کِیسی
+"""
+import kopf
+import kubernetes
+import time
+
+# ── تنظیمات per size ──
+SIZE_CONFIG = {
+    "small":  {"cpu": "500m",  "memory": "1Gi",  "storage": "10Gi",  "replicas": 1},
+    "medium": {"cpu": "1",     "memory": "4Gi",  "storage": "50Gi",  "replicas": 1},
+    "large":  {"cpu": "2",     "memory": "8Gi",  "storage": "100Gi", "replicas": 2},
+}
+
+# ── create handler ──
+@kopf.on.create("myorg.io", "v1", "databases")
+def create_database(spec, name, namespace, logger, **_):
+    engine = spec["engine"]
+    size = spec["size"]
+    version = spec.get("version", "16")
+    cfg = SIZE_CONFIG[size]
+    logger.info("Creating %s-%s (%s)", engine, version, size)
+
+    apps = kubernetes.client.AppsV1Api()
+    core = kubernetes.client.CoreV1Api()
+
+    # ۱. Secret برای password
+    password = kubernetes.client.V1Secret(
+        metadata=kubernetes.client.V1ObjectMeta(
+            name=f"{name}-credentials", namespace=namespace),
+        string_data={"password": generate_password()},
+        type="Opaque",
+    )
+    try:
+        core.create_namespaced_secret(namespace, password)
+    except kubernetes.client.exceptions.ApiException as e:
+        if e.status != 409:
+            raise
+
+    # ۲. PVC برای data
+    pvc = kubernetes.client.V1PersistentVolumeClaim(
+        metadata=kubernetes.client.V1ObjectMeta(
+            name=f"{name}-data", namespace=namespace),
+        spec=kubernetes.client.V1PersistentVolumeClaimSpec(
+            access_modes=["ReadWriteOnce"],
+            resources=kubernetes.client.V1ResourceRequirements(
+                requests={"storage": cfg["storage"]}),
+            storage_class_name="fast-ssd",
+        ),
+    )
+    try:
+        core.create_namespaced_persistent_volume_claim(namespace, pvc)
+    except kubernetes.client.exceptions.ApiException as e:
+        if e.status != 409:
+            raise
+
+    # ۳. StatefulSet
+    sts = kubernetes.client.V1StatefulSet(
+        metadata=kubernetes.client.V1ObjectMeta(
+            name=name, namespace=namespace),
+        spec=kubernetes.client.V1StatefulSetSpec(
+            replicas=cfg["replicas"],
+            service_name=name,
+            selector=kubernetes.client.V1LabelSelector(
+                match_labels={"app": name}),
+            template=kubernetes.client.V1PodTemplateSpec(
+                metadata=kubernetes.client.V1ObjectMeta(
+                    labels={"app": name}),
+                spec=kubernetes.client.V1PodSpec(
+                    containers=[
+                        kubernetes.client.V1Container(
+                            name="db",
+                            image=f"{engine}:{version}",
+                            env=[
+                                kubernetes.client.V1EnvVar(
+                                    name="POSTGRES_PASSWORD",
+                                    value_from=kubernetes.client.V1EnvVarSource(
+                                        secret_key_ref=kubernetes.client.V1SecretKeySelector(
+                                            name=f"{name}-credentials",
+                                            key="password")))
+                                ] if engine == "postgres" else [],
+                            ports=[kubernetes.client.V1ContainerPort(5432)],
+                            resources=kubernetes.client.V1ResourceRequirements(
+                                requests={"cpu": cfg["cpu"],
+                                          "memory": cfg["memory"]},
+                                limits={"cpu": cfg["cpu"],
+                                        "memory": cfg["memory"]},
+                            ),
+                            volume_mounts=[
+                                kubernetes.client.V1VolumeMount(
+                                    name="data", mount_path="/var/lib/postgresql/data")
+                            ] if engine == "postgres" else [],
+                        )
+                    ],
+                    volumes=[
+                        kubernetes.client.V1Volume(
+                            name="data",
+                            persistent_volume_claim=kubernetes.client.V1PersistentVolumeClaimVolumeSource(
+                                claim_name=f"{name}-data"))
+                    ],
+                )
+            ),
+        )
+    )
+    try:
+        apps.create_namespaced_stateful_set(namespace, sts)
+    except kubernetes.client.exceptions.ApiException as e:
+        if e.status != 409:
+            raise
+
+    # ۴. Headless Service
+    svc = kubernetes.client.V1Service(
+        metadata=kubernetes.client.V1ObjectMeta(
+            name=name, namespace=namespace),
+        spec=kubernetes.client.V1ServiceSpec(
+            cluster_ip="None",
+            selector={"app": name},
+            ports=[kubernetes.client.V1ServicePort(
+                port=5432 if engine == "postgres" else 3306)],
+        )
+    )
+    try:
+        core.create_namespaced_service(namespace, svc)
+    except kubernetes.client.exceptions.ApiException as e:
+        if e.status != 409:
+            raise
+
+    return {
+        "phase": "provisioning",
+        "endpoint": f"{name}.{namespace}.svc.cluster.local",
+    }
+
+# ── update handler ──
+@kopf.on.update("myorg.io", "v1", "databases")
+def update_database(spec, old, new, name, namespace, logger, **_):
+    if spec.get("size") != old.get("size"):
+        new_cfg = SIZE_CONFIG[spec["size"]]
+        logger.info("Resizing %s to %s", name, spec["size"])
+        apps = kubernetes.client.AppsV1Api()
+        patch = {"spec": {"template": {"spec": {"containers": [{
+            "name": "db",
+            "resources": {
+                "requests": {"cpu": new_cfg["cpu"], "memory": new_cfg["memory"]},
+                "limits":   {"cpu": new_cfg["cpu"], "memory": new_cfg["memory"]},
+            }
+        }]}}}}
+        apps.patch_namespaced_stateful_set(name, namespace, patch)
+
+# ── delete handler ──
+@kopf.on.delete("myorg.io", "v1", "databases")
+def delete_database(name, namespace, logger, **_):
+    logger.info("Deleting %s", name)
+    # منابع دیگر به‌طور خودکار حذف نمی‌شوند — اینجا صریح حذف کن
+    # (PVC را با ownerReference در create تنظیم کردیم، پس self-delete می‌شود)
+
+# ── periodic: monitoring ──
+@kopf.timer("myorg.io", "v1", "databases", interval=60)
+def monitor(spec, name, namespace, logger, **_):
+    apps = kubernetes.client.AppsV1Api()
+    try:
+        sts = apps.read_namespaced_stateful_set(name, namespace)
+        ready = sts.status.ready_replicas or 0
+        desired = sts.spec.replicas
+        if ready < desired:
+            logger.warning("%s: %d/%d ready", name, ready, desired)
+    except kubernetes.client.exceptions.ApiException as e:
+        logger.error("Cannot read STS: %s", e)
+
+def generate_password():
+    import secrets, string
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(32))
+
+if __name__ == "__main__":
+    kopf.run()
+
+۵.۳ — Dockerfile برای Operator
+dockerfile
+
+FROM python:3.12-slim
+WORKDIR /app
+RUN pip install --no-cache-dir kopf kubernetes
+COPY database-operator.py /app/
+USER 1000:1000
+CMD ["kopf", "run", "/app/database-operator.py", "--verbose"]
+
+۵.۴ — Deployment + RBAC
+yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: database-operator
+  namespace: db-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: database-operator}
+  template:
+    metadata:
+      labels: {app: database-operator}
+    spec:
+      serviceAccountName: database-operator
+      containers:
+        - name: operator
+          image: registry.local/k8s/database-operator:1.0.0
+          env:
+            - {name: PYTHONUNBUFFERED, value: "1"}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits:   {cpu: 500m, memory: 256Mi}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: database-operator
+  namespace: db-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: database-operator
+rules:
+  - apiGroups: ["myorg.io"]
+    resources: [databases]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: ["myorg.io"]
+    resources: [databases/status]
+    verbs: [update, patch]
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [""]
+    resources: [services, secrets, persistentvolumeclaims]
+    verbs: [get, list, watch, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: database-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: database-operator
+subjects:
+  - kind: ServiceAccount
+    name: database-operator
+    namespace: db-operator
+
+۵.۵ — استفاده
+yaml
+
+# databases.yaml
+apiVersion: myorg.io/v1
+kind: Database
+metadata:
+  name: users-db
+  namespace: production
+spec:
+  engine: postgres
+  size: medium
+  version: "16"
+
+bash
+
+kubectl apply -f databases.yaml
+kubectl get db -n production
+# انتظار:
+# NAME       ENGINE     SIZE     PHASE
+# users-db   postgres   medium   provisioning
+
+kubectl -n production get sts,pvc,secret,svc | grep users-db
+# ✅ همه resources ساخته شده‌اند
+
+# چک status:
+kubectl -n production get db users-db -o jsonpath='{.status}' | jq .
+
+⚡ بخش ۶: Async با kubernetes-asyncio
+۶.۱ — مزیت
+python
+
+import asyncio
+from kubernetes_asyncio import client, config
+
+async def get_pod_count(api, namespace):
+    pods = await api.list_namespaced_pod(namespace)
+    return len(pods.items)
+
+async def main():
+    await config.load_kube_config()
+    api = client.CoreV1Api()
+    # ۵۰ namespace را موازی بررسی کن — نه سری
+    namespaces = ["ns1", "ns2", "ns3", ...]  # ۵۰ عدد
+    counts = await asyncio.gather(*[
+        get_pod_count(api, ns) for ns in namespaces
+    ])
+    print(dict(zip(namespaces, counts)))
+    await api.close()
+
+asyncio.run(main())
+
+مزیت: برای اسکریپت‌هایی که N درخواست API دارند، تا ۱۰x سریع‌تر.
+🏭 بخش ۷: استفاده در CI/CD
+۷.۱ — Smoke Test بعد از Deploy
+python
+
+#!/usr/bin/env python3
+"""
+smoke-test.py
+بعد از هر deploy، این اسکریپت را اجرا کن
+"""
+import sys
+import time
+from kubernetes import client, config
+
+config.load_incluster_config()
+apps = client.AppsV1Api()
+v1 = client.CoreV1Api()
+
+NAMESPACE = sys.argv[1] if len(sys.argv) > 1 else "default"
+DEPLOY = sys.argv[2] if len(sys.argv) > 2 else "app"
+
+def wait_rollout(deploy, ns, timeout=300):
+    start = time.time()
+    while time.time() - start < timeout:
+        d = apps.read_namespaced_deployment(deploy, ns)
+        if (d.status.updated_replicas == d.spec.replicas
+                and d.status.replicas == d.status.updated_replicas
+                and d.status.available_replicas == d.spec.replicas):
+            return True
+        time.sleep(5)
+    return False
+
+def main():
+    print(f"⏳ Waiting for {NAMESPACE}/{DEPLOY} rollout...")
+    if not wait_rollout(DEPLOY, NAMESPACE):
+        print("❌ Timeout")
+        sys.exit(1)
+
+    # چک پادها
+    pods = v1.list_namespaced_pod(
+        NAMESPACE, label_selector=f"app={DEPLOY}").items
+    print(f"Found {len(pods)} pods")
+    for p in pods:
+        if p.status.phase != "Running":
+            print(f"❌ {p.metadata.name}={p.status.phase}")
+            sys.exit(1)
+        for cs in (p.status.container_statuses or []):
+            if not cs.ready:
+                print(f"❌ {p.metadata.name}/{cs.name} not ready")
+                sys.exit(1)
+
+    # چک service
+    svc = v1.read_namespaced_service(DEPLOY, NAMESPACE)
+    print(f"✅ service {svc.metadata.name} exists")
+
+    print("🎉 Smoke test passed")
+
+if __name__ == "__main__":
+    main()
+
+GitLab CI:
+yaml
+
+deploy:
+  script:
+    - kubectl apply -f manifests/
+    - kubectl rollout status deploy/app -n production --timeout=300s
+    - python3 smoke-test.py production app
+
+⚠️ بخش ۸: Anti-Patterns
+Anti-Pattern	چرا بد	جایگزین
+subprocess.run(["kubectl", ...])	parse خروجی سخت، idempotent نیست، خطا مبهم	kubernetes.core client
+while True: patch_replicas()	ReplicaSet همین کار را می‌کند	HPA
+time.sleep() برای wait	race condition	wait_condition یا watch
+ذخیره‌ی state در Python	reconcile گم می‌شود	kopf/CRD
+config.load_kube_config() در cluster	crash	load_incluster_config()
+try: ... except: pass	باگ مخفی	ApiException با status
+list_pod_for_all_namespaces بدون limit	overload API	pagination + field_selector
+Python برای deploy app	rollback سخت	ArgoCD
+Secret در logs	leak	logger.info("pod=%s", p.metadata.name) — نه secret
+Threading برای همزمانی K8s	GIL + blocking	kubernetes_asyncio یا ThreadPoolExecutor
+🎯 بخش ۹: جدول تصمیم نهایی
+کار	Python؟	ابزار بهتر
+Deploy app	❌	ArgoCD/Helm
+Operator با منطق پیچیده	✅ kopf	—
+Cleanup دوره‌ای	✅ cron + kubernetes	—
+Cost audit سفارشی	✅	—
+Preview env از PR	✅	یا ArgoCD ApplicationSet
+Compliance سفارشی	⚠️	OPA/Gatekeeper/Kyverno
+Chaos engineering	✅	chaos-mesh (اگر نیاز سنگین)
+Backup orchestration	✅	Velero (اگر نیاز کامل)
+DB migration	⚠️	Job در K8s
+CI smoke test	✅	—
+CLI داخلی برای devs	✅	—
+Config drift detection	✅	GitOps (اولویت)
+Multi-cluster sync	✅	Fleet/ArgoCD
+Real-time monitoring	❌	Prometheus + exporters
+📎 خلاصه‌ی کاربردی
+text
+
+🐍 Python در Kubernetes:
+├── ۱. اسکریپت‌های خودکار (cron):
+│   ├── cleanup-completed-pods.py
+│   ├── cost-audit.py
+│   ├── compliance-check.py
+│   └── etcd-backup-verify.py
+│
+├── ۲. Operator / Controller (kopf):
+│   ├── database-operator.py
+│   ├── ingress-operator.py
+│   └── backup-operator.py
+│
+├── ۳. Internal tools:
+│   ├── preview-env.py
+│   ├── smart-drain.py
+│   └── deploy-bot (Slack)
+│
+├── ۴. CI/CD helpers:
+│   ├── smoke-test.py
+│   └── verify-rollout.py
+│
+└── ۵. Chaos/Testing:
+    ├── chaos-kill.py
+    └── load-test.py
+
+قانون طلایی:
+  ✅ اگر منطق پیچیده، stateful، یا periodic → Python
+  ❌ اگر declarative، version-controlled → GitOps
+
+پیشنهاد شروع:
+
+    cleanup-completed-pods.py را همین هفته نصب کن — فوری etcd را کوچک می‌کند
+
+    cost-audit.py را ماهانه اجرا کن
+
+    preview-env.py را برای تیم dev راه بیانداز
+
+    اگر Operator نیاز داری، با kopf شروع کن
+
+
